@@ -124,6 +124,67 @@ def hydrate_universe_from_wiki(keys: List[str]) -> pd.DataFrame:
 def hydrate_universe_from_yf(keys: List[str]) -> pd.DataFrame:
     """
     yfinance の内蔵リストでユニバースを組む（鍵不要・無料）。
+    優先: sp500, dow30 を確実化。nasdaq は取得できた場合のみ追加。
+    全部ダメなら上位流動性のハードコード種リストにフォールバック。
+    """
+    rows = []
+
+    # 強い順に段階的に足す（途中で失敗しても続行）
+    try:
+        if any(k in ("sp500", "s&p500") for k in keys):
+            arr = []
+            try:
+                arr = yf.tickers_sp500()
+            except Exception:
+                arr = []
+            for t in arr or []:
+                rows.append((t, "", "sp500"))
+    except Exception:
+        pass
+
+    try:
+        if any(k in ("dow30", "dow") for k in keys):
+            arr = []
+            try:
+                arr = yf.tickers_dow()
+            except Exception:
+                arr = []
+            for t in arr or []:
+                rows.append((t, "", "dow30"))
+    except Exception:
+        pass
+
+    # Nasdaq は重くて失敗しやすい → 取れたら追加、ダメでも落とさない
+    try:
+        if any(k in ("nasdaq100", "nasdaq") for k in keys):
+            arr = []
+            try:
+                arr = yf.tickers_nasdaq()
+            except Exception:
+                arr = []
+            # 取りすぎ回避：万単位になるため上限を決める（任意：ここでは上位2000だけ）
+            for t in (arr or [])[:2000]:
+                rows.append((t, "", "nasdaq_all"))
+    except Exception:
+        pass
+
+    # ここまでで rows が空なら、ハードコードの“上位流動性シード”へフォールバック
+    if not rows:
+        seed = [
+            "AAPL","MSFT","NVDA","AMZN","GOOGL","GOOG","META","TSLA","AVGO","BRK-B","UNH",
+            "JPM","XOM","JNJ","V","PG","MA","COST","HD","CVX","MRK","ABBV","PEP","KO",
+            "BAC","PFE","TMO","ORCL","CSCO","WMT","NFLX","ADBE","CRM","AMD","INTC",
+            "QCOM","TXN","IBM","NKE","MCD","WFC","CAT","LIN","UPS","PM","MS","AMGN",
+            "HON","RTX","BLK","GS","SCHW","DE","GE","NOW","SHOP","SPY","QQQ"
+        ]
+        rows = [(t, "", "seed_top_liquidity") for t in seed]
+
+    df = pd.DataFrame(rows, columns=["ticker","name","list_source"]).drop_duplicates("ticker")
+    df["ticker"] = df["ticker"].astype(str).str.strip().str.upper()
+    return df.reset_index(drop=True)
+
+    """
+    yfinance の内蔵リストでユニバースを組む（鍵不要・無料）。
     対応: sp500, dow30, nasdaq100(代替として全Nasdaq), その他キーはスキップ
     """
     rows = []
