@@ -1,7 +1,7 @@
 name: US EOD Liquidity Report (Diag Safe)
 
 on:
-  workflow_dispatch: {}     # 手動でまずテスト
+  workflow_dispatch: {}     # 手動テスト
   schedule:
     - cron: '40 10 * * 1-5' # 19:40 JST (平日)
     - cron: '00 11 * * 1-5' # 20:00 JST (平日)
@@ -21,6 +21,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
+        shell: bash
         run: |
           python -V
           python -m pip install --upgrade pip
@@ -28,32 +29,30 @@ jobs:
           which zip || (sudo apt-get update && sudo apt-get install -y zip)
 
       - name: Smoke test env
-        run: |
-          python - << 'PY'
-          import sys, pandas, numpy, yfinance
-          print("OK: imports")
-          PY
+        shell: bash
+        run: python -c "import pandas, numpy, yfinance; print('OK: imports')"
 
       - name: Run report (diag: small N, yf-only universe)
+        shell: bash
         env:
           TIINGO_API_TOKEN: ${{ secrets.TIINGO_API_TOKEN }}
           ALPHAVANTAGE_API_KEY: ${{ secrets.ALPHAVANTAGE_API_KEY }}
-          FORCE_UNIVERSE_SOURCE: "yf"     # ← 追加：念のため環境変数でも固定
+          FORCE_UNIVERSE_SOURCE: "yf"   # ← 環境変数でも強制
         run: |
-          set -e
+          set -euo pipefail
           TS=$(TZ=Asia/Tokyo date +%Y%m%d)
           mkdir -p out/$TS
-          # まずは軽量で通す（N小さめ、期間短め、ユニバース= yfinance起点）
           python run_us_eod_liquidity_report.py \
             --N 150 \
             --since_days 180 \
             --universe_source "yf" \
             --source_order "yf,tiingo,alphav" \
             --outdir out/$TS
-          # 任意：最新コピーも残す
+          # 最新コピー（任意）
           rm -rf out/latest && mkdir -p out/latest && cp -r out/$TS/* out/latest/
-        
+
       - name: Pack single ZIP
+        shell: bash
         run: |
           TS=$(TZ=Asia/Tokyo date +%Y%m%d)
           cd out && zip -rq ../us-eod-report-$TS.zip . && cd ..
