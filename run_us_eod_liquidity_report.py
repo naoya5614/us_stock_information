@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 EOD（前日終値）×上位流動性N銘柄の一括取得→分析→A〜F出力
-- フリー優先のフェイルオーバー: yfinance → Tiingo → Alpha Vantage
+- フリー優先のフェイルオーバー: yfinance（一括/個別） → Tiingo → Alpha Vantage
 - 取得できた銘柄の中から ADV20（出来高×終値）上位で N を確定
 - 確定N銘柄に対して coverage=100% を担保（未取得銘柄は集合から外す）
 - すべてEODベース（リアルタイム/時間外は未取得）
@@ -24,7 +24,7 @@ EOD（前日終値）×上位流動性N銘柄の一括取得→分析→A〜F出
   python run_us_eod_liquidity_report.py --N 1500 --outdir out --universe_source yf
 """
 
-import os, sys, time, math, argparse
+import os, sys, time, argparse
 from datetime import datetime as dt, timedelta, timezone
 from typing import List, Tuple, Optional, Dict
 
@@ -184,6 +184,63 @@ def hydrate_universe_from_yf(keys: List[str]) -> pd.DataFrame:
     df["ticker"] = df["ticker"].astype(str).str.strip().str.upper()
     return df.reset_index(drop=True)
 
+# ---------- yfinance まとめ取り ----------
+def yf_batch_download(tickers: List[str], start: str, end: str) -> Dict[str, pd.DataFrame]:
+    """
+    yfinanceのまとめ取りでレート制限を回避。MultiIndex列を銘柄ごとDataFrameに展開。
+    取れた銘柄だけ返す（空は落とす）。
+    """
+    out: Dict[str, pd.DataFrame] = {}
+    if not tickers:
+        return out
+    try:
+        data = yf.download(
+            tickers=tickers,
+            start=start, end=end,
+            interval="1d",
+            group_by="ticker",  # 銘柄ごと列束
+            auto_adjust=False,
+            threads=True,
+            progress=False
+        )
+    except Exception:
+        return out
+
+    if isinstance(data.columns, pd.MultiIndex):
+        for t in sorted(set([c[0] for c in data.columns])):
+            try:
+                sub = data[t].copy()
+                if sub is None or sub.empty:
+                    continue
+                sub = sub.reset_index().rename(columns={
+                    "Date":"date","Open":"open","High":"high","Low":"low",
+                    "Close":"close","Adj Close":"adjClose","Volume":"volume"
+                })
+                sub["date"] = pd.to_datetime(sub["date"]).dt.tz_localize(None)
+                for c in ["open","high","low","close","volume","adjClose"]:
+                    if c not in sub.columns:
+                        sub[c] = np.nan
+                sub = sub.sort_values("date").reset_index(drop=True)
+                if not sub.empty and sub["close"].notna().any():
+                    out[t.upper()] = sub
+            except Exception:
+                continue
+    else:
+        # 単一銘柄のとき（保険）
+        sub = data.reset_index().rename(columns={
+            "Date":"date","Open":"open","High":"high","Low":"low",
+            "Close":"close","Adj Close":"adjClose","Volume":"volume"
+        })
+        sub["date"] = pd.to_datetime(sub["date"]).dt.tz_localize(None)
+        for c in ["open","high","low","close","volume","adjClose"]:
+            if c not in sub.columns:
+                sub[c] = np.nan
+        sub = sub.sort_values("date").reset_index(drop=True)
+        if not sub.empty and sub["close"].notna().any():
+            out[tickers[0].upper()] = sub
+
+    return out
+
 # ---------- データ取得（yfinance / Tiingo / AlphaVantage） ----------
 def yf_daily(ticker: str, start: str, end: str) -> Optional[pd.DataFrame]:
     """yfinance単独の揮発に強くする：download→空ならhistoryで再取得、2回までリトライ"""
@@ -293,7 +350,7 @@ def true_range(df: pd.DataFrame) -> pd.Series:
     prev_close = df["close"].shift(1)
     tr1 = df["high"] - df["low"]
     tr2 = (df["high"] - prev_close).abs()
-    tr3 = (df["low"] - df["close"].shift(1)).abs()
+    tr3 = (df["low"] - prev_close).abs()
     return pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
 def atr(df: pd.DataFrame, period: int=14) -> pd.Series:
@@ -351,6 +408,11 @@ def main():
     start_date = (dt.utcnow().date() - timedelta(days=args.since_days)).strftime("%Y-%m-%d")
     end_date   = dt.utcnow().date().strftime("%Y-%m-%d")
 
+    # yfinance history(period="1y") の保険として、最低365日に丸め
+    min_days = 365
+    if args.since_days < min_days:
+        start_date = (dt.utcnow().date() - timedelta(days=min_days)).strftime("%Y-%m-%d")
+
     # 1) 候補プール（ユニバース取得の順序に従う）
     idx_keys = [k.strip().lower() for k in args.universe.split(",") if k.strip()]
     uni_df = build_universe(idx_keys, uni_src_order)  # ticker, name, list_source
@@ -379,11 +441,28 @@ def main():
     used_src: Dict[str, str] = {}
     tickers = [t for t in uni_df["ticker"].tolist() if t.upper() != SPY_SYMBOL]
 
-    for t in tqdm(tickers, desc="Fetching EOD", ncols=90):
+    # --- まず yfinance をバッチでまとめ取得（50銘柄ずつ） ---
+    batch_size = 50
+    for i in range(0, len(tickers), batch_size):
+        chunk = tickers[i:i+batch_size]
+        got = yf_batch_download(chunk, start_date, end_date)
+        for t, df in got.items():
+            fetched[t] = df
+            used_src[t] = "yf(batch)"
+        time.sleep(1.0)  # 軽い間引き
+
+    # --- バッチで取れなかった残りは個別フェイルオーバー ---
+    for t in tqdm(tickers, desc="Fetching EOD (fallback)", ncols=90):
+        if t in fetched:
+            continue
         df, src = fetch_prices_history(t, start_date, end_date, tiingo_token, alphav_key, order)
         if df is None or df.empty:
+            # 最後の最後に yfinance 個別の history 再試行
+            df = yf_daily(t, start_date, end_date)
+            src = "yf(history)" if (df is not None and not df.empty) else src
+        if df is None or df.empty:
+            time.sleep(0.2)
             continue
-        # 必須は date/close のみ。他は無ければ NaN のまま許容する
         need = {"date","close"}
         if not need.issubset(df.columns):
             continue
@@ -392,6 +471,7 @@ def main():
         used_src[t] = src
         if len(fetched) < 3:
             print(f"[dbg] {t} got from {src} rows={len(df)} cols={list(df.columns)}", file=sys.stderr)
+        time.sleep(0.1)
 
     if not fetched:
         raise RuntimeError("EODを取得できた銘柄がありません。データ源やレート制限をご確認ください。")
