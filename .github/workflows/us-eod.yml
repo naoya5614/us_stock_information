@@ -30,9 +30,9 @@ jobs:
 
       - name: Smoke test env
         shell: bash
-        run: python -c "import pandas, numpy, yfinance; print('OK: imports')"
+        run: "python -c \"import pandas, numpy, yfinance; print('OK: imports')\""
 
-      - name: Run report (diag: small N, yf-only universe)
+      - name: "Run report (diag: small N, yf-only universe)"
         shell: bash
         env:
           TIINGO_API_TOKEN: ${{ secrets.TIINGO_API_TOKEN }}
