@@ -1,0 +1,43 @@
+name: US EOD Liquidity Report (Free Sources)
+
+on:
+  schedule:
+    # JST 19:40 / 20:00 は UTC 10:40 / 11:00（平日）
+    - cron: '40 10 * * 1-5'
+    - cron: '00 11 * * 1-5'
+  workflow_dispatch: {}   # 手動実行ボタン
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install pandas numpy requests tqdm pyarrow yfinance
+
+      - name: Run report (EOD / Top Liquidity N)
+        env:
+          TIINGO_API_TOKEN: ${{ secrets.TIINGO_API_TOKEN }}
+          ALPHAVANTAGE_API_KEY: ${{ secrets.ALPHAVANTAGE_API_KEY }}
+        run: |
+          # 日付フォルダと latest の両方に保存（履歴と最新を両立）
+          TS=$(TZ=Asia/Tokyo date +%Y%m%d)
+          mkdir -p out/$TS
+          python run_us_eod_liquidity_report.py --N 1500 --outdir out/$TS
+          rm -rf out/latest && mkdir -p out/latest && cp -r out/$TS/* out/latest/
+
+      - name: Upload artifacts (dated)
+        uses: actions/upload-artifact@v4
+        with:
+          name: us-eod-report-${{ steps.ts.outputs.today || 'dated' }}
+          path: out/*
+          retention-days: 14
