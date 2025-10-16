@@ -6,6 +6,7 @@ EOD（前日終値）×上位流動性N銘柄の一括取得→分析→A〜F出
 - 取得できた銘柄の中から ADV20（出来高×終値）上位で N を確定
 - 確定N銘柄に対して coverage=100% を担保（未取得銘柄は集合から外す）
 - すべてEODベース（リアルタイム/時間外は未取得）
+- ユニバース取得元は --universe_source で制御（"wiki,yf" が既定）
 
 出力（--outdir 配下）:
  A) market_summary.txt
@@ -17,6 +18,10 @@ EOD（前日終値）×上位流動性N銘柄の一括取得→分析→A〜F出
  参考) security_master_us.parquet (pyarrowあり) / .csv (代替)
 
 依存: pandas numpy requests tqdm pyarrow(任意) yfinance
+使い方:
+  pip install pandas numpy requests tqdm pyarrow yfinance
+  export TIINGO_API_TOKEN=... ; export ALPHAVANTAGE_API_KEY=...
+  python run_us_eod_liquidity_report.py --N 1500 --outdir out --universe_source yf
 """
 
 import os, sys, time, math, argparse
@@ -73,7 +78,7 @@ def parse_wiki_tickers(html: str) -> List[Tuple[str, str]]:
     results = []
     for df in tables:
         cols = [str(c).lower() for c in df.columns]
-        if not any("symbol" in c for c in cols): 
+        if not any("symbol" in c for c in cols):
             continue
         name_idx = None
         for key in ["security", "company", "name"]:
@@ -81,7 +86,7 @@ def parse_wiki_tickers(html: str) -> List[Tuple[str, str]]:
             if arr:
                 name_idx = arr[0]; break
         sym_idx = [i for i, c in enumerate(cols) if "symbol" in c]
-        if not sym_idx: 
+        if not sym_idx:
             continue
         sidx = sym_idx[0]
         for _, row in df.iterrows():
@@ -101,7 +106,7 @@ def hydrate_universe_from_wiki(keys: List[str]) -> pd.DataFrame:
     rows = []
     for k in keys:
         url = WIKI_LISTS.get(k)
-        if not url: 
+        if not url:
             continue
         r = robust_get(url, timeout=40)
         if not r:
@@ -113,7 +118,71 @@ def hydrate_universe_from_wiki(keys: List[str]) -> pd.DataFrame:
     if not rows:
         raise RuntimeError("Index lists fetch failed (Wikipedia).")
     df = pd.DataFrame(rows, columns=["ticker","name","list_source"]).drop_duplicates("ticker")
+    df["ticker"] = df["ticker"].astype(str).str.strip().str.upper()
     return df.reset_index(drop=True)
+
+def hydrate_universe_from_yf(keys: List[str]) -> pd.DataFrame:
+    """
+    yfinance の内蔵リストでユニバースを組む（鍵不要・無料）。
+    対応: sp500, dow30, nasdaq100(代替として全Nasdaq), その他キーはスキップ
+    """
+    rows = []
+
+    # S&P 500
+    try:
+        if any(k in ("sp500", "s&p500") for k in keys):
+            for t in yf.tickers_sp500():
+                rows.append((t, "", "sp500"))
+    except Exception:
+        pass
+
+    # Dow 30
+    try:
+        if any(k in ("dow30", "dow") for k in keys):
+            for t in yf.tickers_dow():
+                rows.append((t, "", "dow30"))
+    except Exception:
+        pass
+
+    # Nasdaq-100 → 代替としてNasdaq全体（yfinanceは全Nasdaqの関数を提供）
+    try:
+        if any(k in ("nasdaq100", "nasdaq") for k in keys):
+            for t in yf.tickers_nasdaq():
+                rows.append((t, "", "nasdaq_all"))
+    except Exception:
+        pass
+
+    if not rows:
+        raise RuntimeError("yfinance 由来のユニバース構築に失敗しました。")
+    df = pd.DataFrame(rows, columns=["ticker","name","list_source"]).drop_duplicates("ticker")
+    df["ticker"] = df["ticker"].astype(str).str.strip().str.upper()
+    return df.reset_index(drop=True)
+
+def build_universe(keys: List[str], source_order: List[str]) -> pd.DataFrame:
+    """
+    source_order 例: ["wiki","yf"] / ["yf"] / ["file:data/universe.csv"]
+    file: の場合、CSVに少なくとも 'ticker' 列が必要。'name' がなければ空で補完。
+    """
+    last_err = None
+    for src in source_order:
+        try:
+            if src == "wiki":
+                return hydrate_universe_from_wiki(keys)
+            elif src == "yf":
+                return hydrate_universe_from_yf(keys)
+            elif src.startswith("file:"):
+                path = src.split("file:",1)[1]
+                df = pd.read_csv(path)
+                assert "ticker" in df.columns
+                if "name" not in df.columns:
+                    df["name"] = ""
+                df["list_source"] = "file"
+                df["ticker"] = df["ticker"].astype(str).str.strip().str.upper()
+                return df[["ticker","name","list_source"]].drop_duplicates("ticker").reset_index(drop=True)
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"Universe build failed. Last error: {last_err}")
 
 # ---------- データ取得（yfinance / Tiingo / AlphaVantage） ----------
 def yf_daily(ticker: str, start: str, end: str) -> Optional[pd.DataFrame]:
@@ -131,7 +200,7 @@ def yf_daily(ticker: str, start: str, end: str) -> Optional[pd.DataFrame]:
         return None
 
 def tiingo_daily(ticker: str, token: Optional[str], start: str, end: str) -> Optional[pd.DataFrame]:
-    if not token: 
+    if not token:
         return None
     url = f"https://api.tiingo.com/tiingo/daily/{ticker}/prices"
     params = {"startDate": start, "endDate": end, "format": "json", "token": token}
@@ -144,10 +213,9 @@ def tiingo_daily(ticker: str, token: Optional[str], start: str, end: str) -> Opt
             return None
         df = pd.DataFrame(data)
         df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
-        # 正規化
-        for c_from, c_to in [("adjClose","adjClose"),("close","close"),("open","open"),("high","high"),("low","low"),("volume","volume")]:
-            if c_from not in df.columns:
-                df[c_from] = np.nan
+        for c in ["open","high","low","close","adjClose","volume"]:
+            if c not in df.columns:
+                df[c] = np.nan
         return df.sort_values("date").reset_index(drop=True)
     except Exception:
         return None
@@ -244,7 +312,9 @@ def main():
                     help="候補プールに使う指数（カンマ区切り）")
     ap.add_argument("--since_days", type=int, default=CAL_DAYS_BACK, help="何日前までのEODを取るか（カレンダー日）")
     ap.add_argument("--source_order", type=str, default="yf,tiingo,alphav",
-                    help="取得優先順（例: 'yf,tiingo,alphav'）")
+                    help="価格取得の優先順（例: 'yf,tiingo,alphav'）")
+    ap.add_argument("--universe_source", type=str, default="wiki,yf",
+                    help="ユニバース取得の優先順（例: 'wiki,yf' or 'yf' or 'file:data/universe.csv'）")
     args = ap.parse_args()
 
     outdir = args.outdir
@@ -253,14 +323,15 @@ def main():
     tiingo_token = os.getenv("TIINGO_API_TOKEN", "").strip() or None
     alphav_key   = os.getenv("ALPHAVANTAGE_API_KEY", "").strip() or None
     order = [s.strip() for s in args.source_order.split(",") if s.strip()]
+    uni_src_order = [s.strip() for s in args.universe_source.split(",") if s.strip()]
 
     run_ts = jst_now_str()
     start_date = (dt.utcnow().date() - timedelta(days=args.since_days)).strftime("%Y-%m-%d")
     end_date   = dt.utcnow().date().strftime("%Y-%m-%d")
 
-    # 1) 候補プール（Wikipediaの指数ユニオン）
+    # 1) 候補プール（ユニバース取得の順序に従う）
     idx_keys = [k.strip().lower() for k in args.universe.split(",") if k.strip()]
-    uni_df = hydrate_universe_from_wiki(idx_keys)  # ticker, name, list_source
+    uni_df = build_universe(idx_keys, uni_src_order)  # ticker, name, list_source
 
     # 保存（parquet優先）
     sm_parq = os.path.join(outdir, "security_master_us.parquet")
@@ -404,15 +475,11 @@ def main():
 
         # Analysis（E）
         # RS（12週=60d）をベンチマーク比で厳密化：過去60営業日の相対価格比
-        rs_12w_percentile = np.nan
-        if len(df) >= 60:
-            # SPYと日付で揃え、比率の60日リターンを比較
-            tmp = pd.merge(df[["date","close"]], spy[["date","close"]].rename(columns={"close":"spy_close"}), on="date", how="inner")
-            if len(tmp) >= 60:
-                tmp["rel"] = (tmp["close"]/tmp["spy_close"]) / (tmp["close"].shift(60)/tmp["spy_close"].shift(60)) - 1.0
-                rs_12w = tmp["rel"].iloc[-1] * 100.0
-                # 後で全体パーセンタイルにするため一旦保存
-                rs_12w_percentile = rs_12w  # ここは一時値、後でrankに差し替え
+        rs_12w_score = np.nan
+        tmp = pd.merge(df[["date","close"]], spy[["date","close"]].rename(columns={"close":"spy_close"}), on="date", how="inner")
+        if len(tmp) >= 60:
+            tmp["rel"] = (tmp["close"]/tmp["spy_close"]) / (tmp["close"].shift(60)/tmp["spy_close"].shift(60)) - 1.0
+            rs_12w_score = tmp["rel"].iloc[-1] * 100.0  # 後で全体パーセンタイルに変換
 
         trend_stack = ""
         if pd.notna(last.get("ema20")) and pd.notna(last.get("ema50")) and pd.notna(last.get("ema200")):
@@ -437,7 +504,7 @@ def main():
             float(last.get("adv20_shares", np.nan))*float(last["close"]) if pd.notna(last.get("adv20_shares", np.nan)) else "",
             float(last.get("dist_52w_high", np.nan)) if pd.notna(last.get("dist_52w_high", np.nan)) else "",
             float(last.get("dist_52w_low", np.nan))  if pd.notna(last.get("dist_52w_low", np.nan))  else "",
-            rs_12w_percentile,  # 後で全体パーセンタイルに変換
+            rs_12w_score,  # 後で全体パーセンタイルに変換
             trend_stack,
             new_high_20d,
             new_low_20d,
@@ -463,11 +530,10 @@ def main():
                      "comp_score","risk_band","analysis_note","inside_day","NR7"]
     analysis_df = pd.DataFrame(analysis_rows, columns=analysis_cols)
 
-    # rs_12w_percentile を全体ランクに変換（現状は「相対12週リターン%」の生値）
-    if "rs_12w_percentile" in analysis_df.columns:
-        vals = pd.to_numeric(analysis_df["rs_12w_percentile"], errors="coerce")
-        ranks = vals.rank(pct=True) * 100.0
-        analysis_df["rs_12w_percentile"] = ranks.round(2)
+    # rs_12w_percentile：全体ランクに変換（現状は相対12週リターン%の生値）
+    vals = pd.to_numeric(analysis_df["rs_12w_percentile"], errors="coerce")
+    ranks = vals.rank(pct=True) * 100.0
+    analysis_df["rs_12w_percentile"] = ranks.round(2)
 
     # comp_score（0-100）: モメンタム/相対力/トレンド/低ボラを合成
     def zscore(s: pd.Series):
@@ -481,7 +547,7 @@ def main():
 
     comp = (0.4*mom.fillna(0) + 0.3*rs.fillna(0) + 0.2*trd.fillna(0) + 0.1*risk.fillna(0))
     if comp.max() == comp.min():
-        comp_norm = pd.Series(50.0, index=comp.index)  # 全部同値のとき
+        comp_norm = pd.Series(50.0, index=comp.index)
     else:
         comp_norm = ((comp - comp.min()) / (comp.max() - comp.min()) * 100.0)
     analysis_df["comp_score"] = comp_norm.round(1)
@@ -536,7 +602,7 @@ def main():
     # 7) 出力
     # A
     with open(os.path.join(outdir, "market_summary.txt"), "w", encoding="utf-8") as f:
-        f.write(f"Market Summary — {jst_now_str()}\n\n")
+        f.write(f"Market Summary — {run_ts}\n\n")
         f.write(f"選定N（realized）: {len(prices_df)}\n")
         f.write(f"値上がり数: {rising} / 値下がり数: {falling}\n\n")
         f.write("【上昇率トップ20】\n")
@@ -556,7 +622,7 @@ def main():
         "rows_returned": int(len(prices_df)),
         "coverage_pct": 100.0 if len(prices_df)>0 else 0.0,
         "missing_symbols": "",
-        "data_source_notes": f"fetch_order={order}; universe=Wikipedia index union; master_saved_as={master_saved_as}"
+        "data_source_notes": f"fetch_order={order}; universe_source={uni_src_order}; master_saved_as={master_saved_as}"
     }])
     cov.to_csv(os.path.join(outdir, "coverage_report_us.csv"), index=False)
 
@@ -566,6 +632,7 @@ def main():
         f.write("Data Timestamp & Sources (EOD-only)\n")
         f.write(f"EOD target date: {eod_target}\n")
         f.write(f"Fetch order: {order}\n")
+        f.write(f"Universe source: {uni_src_order}\n")
         f.write(f"Run time (JST): {run_ts}\n")
 
     # E

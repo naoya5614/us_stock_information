@@ -34,9 +34,9 @@ jobs:
         run: |
           TS=$(TZ=Asia/Tokyo date +%Y%m%d)
           mkdir -p out/$TS
-          python run_us_eod_liquidity_report.py --N 1500 --outdir out/$TS
-          # 最新コピー（任意：欲しければ残す）
+          python run_us_eod_liquidity_report.py --N 1500 --outdir out/$TS --universe_source yf
           rm -rf out/latest && mkdir -p out/latest && cp -r out/$TS/* out/latest/
+        
 
       # === ここから ZIP まとめ ===
       - name: Pack single ZIP
