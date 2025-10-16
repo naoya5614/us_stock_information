@@ -1,11 +1,10 @@
-name: US EOD Liquidity Report (Free Sources)
+name: US EOD Liquidity Report (Diag Safe)
 
 on:
+  workflow_dispatch: {}     # 手動でまずテスト
   schedule:
-    # JST 19:40 / 20:00 は UTC 10:40 / 11:00（平日）
-    - cron: '40 10 * * 1-5'
-    - cron: '00 11 * * 1-5'
-  workflow_dispatch: {}
+    - cron: '40 10 * * 1-5' # 19:40 JST (平日)
+    - cron: '00 11 * * 1-5' # 20:00 JST (平日)
 
 jobs:
   run:
@@ -23,29 +22,42 @@ jobs:
 
       - name: Install dependencies
         run: |
+          python -V
+          python -m pip install --upgrade pip
           pip install pandas numpy requests tqdm pyarrow yfinance
-          # 念のためzipコマンドが無いランナー対策
           which zip || (sudo apt-get update && sudo apt-get install -y zip)
 
-      - name: Run report (EOD / Top Liquidity N)
+      - name: Smoke test env
+        run: |
+          python - << 'PY'
+          import sys, pandas, numpy, yfinance
+          print("OK: imports")
+          PY
+
+      - name: Run report (diag: small N, yf-only universe)
         env:
           TIINGO_API_TOKEN: ${{ secrets.TIINGO_API_TOKEN }}
           ALPHAVANTAGE_API_KEY: ${{ secrets.ALPHAVANTAGE_API_KEY }}
         run: |
+          set -e
           TS=$(TZ=Asia/Tokyo date +%Y%m%d)
           mkdir -p out/$TS
-          python run_us_eod_liquidity_report.py --N 1500 --outdir out/$TS --universe_source yf
+          # まずは軽量で通す（N小さめ、期間短め、ユニバース= yfinance起点）
+          python run_us_eod_liquidity_report.py \
+            --N 150 \
+            --since_days 180 \
+            --universe_source yf \
+            --source_order 'yf,tiingo,alphav' \
+            --outdir out/$TS
           rm -rf out/latest && mkdir -p out/latest && cp -r out/$TS/* out/latest/
-        
 
-      # === ここから ZIP まとめ ===
       - name: Pack single ZIP
         run: |
           TS=$(TZ=Asia/Tokyo date +%Y%m%d)
           cd out && zip -rq ../us-eod-report-$TS.zip . && cd ..
           ls -lh us-eod-report-$TS.zip
 
-      - name: Upload single ZIP
+      - name: Upload ZIP
         uses: actions/upload-artifact@v4
         with:
           name: us-eod-report
