@@ -323,7 +323,14 @@ def main():
     tiingo_token = os.getenv("TIINGO_API_TOKEN", "").strip() or None
     alphav_key   = os.getenv("ALPHAVANTAGE_API_KEY", "").strip() or None
     order = [s.strip() for s in args.source_order.split(",") if s.strip()]
+    # 既存:
     uni_src_order = [s.strip() for s in args.universe_source.split(",") if s.strip()]
+
+    # 追加（環境で上書き可能に）
+    env_uni = os.getenv("FORCE_UNIVERSE_SOURCE", "").strip()
+    if env_uni:
+        uni_src_order = [s.strip() for s in env_uni.split(",") if s.strip()]
+
 
     run_ts = jst_now_str()
     start_date = (dt.utcnow().date() - timedelta(days=args.since_days)).strftime("%Y-%m-%d")

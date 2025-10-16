@@ -38,6 +38,7 @@ jobs:
         env:
           TIINGO_API_TOKEN: ${{ secrets.TIINGO_API_TOKEN }}
           ALPHAVANTAGE_API_KEY: ${{ secrets.ALPHAVANTAGE_API_KEY }}
+          FORCE_UNIVERSE_SOURCE: "yf"     # ← 追加：念のため環境変数でも固定
         run: |
           set -e
           TS=$(TZ=Asia/Tokyo date +%Y%m%d)
@@ -46,11 +47,12 @@ jobs:
           python run_us_eod_liquidity_report.py \
             --N 150 \
             --since_days 180 \
-            --universe_source yf \
-            --source_order 'yf,tiingo,alphav' \
+            --universe_source "yf" \
+            --source_order "yf,tiingo,alphav" \
             --outdir out/$TS
+          # 任意：最新コピーも残す
           rm -rf out/latest && mkdir -p out/latest && cp -r out/$TS/* out/latest/
-
+        
       - name: Pack single ZIP
         run: |
           TS=$(TZ=Asia/Tokyo date +%Y%m%d)
