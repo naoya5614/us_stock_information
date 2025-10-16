@@ -131,7 +131,7 @@ def hydrate_universe_from_yf(keys: List[str]) -> pd.DataFrame:
     # S&P 500
     try:
         if any(k in ("sp500", "s&p500") for k in keys):
-            for t in yf.tickers_sp500():
+            for t in yf.Tickers().sp500:
                 rows.append((t, "", "sp500"))
     except Exception:
         pass
@@ -139,7 +139,7 @@ def hydrate_universe_from_yf(keys: List[str]) -> pd.DataFrame:
     # Dow 30
     try:
         if any(k in ("dow30", "dow") for k in keys):
-            for t in yf.tickers_dow():
+            for t in yf.Tickers().dow:
                 rows.append((t, "", "dow30"))
     except Exception:
         pass
@@ -147,7 +147,7 @@ def hydrate_universe_from_yf(keys: List[str]) -> pd.DataFrame:
     # Nasdaq-100 → 代替としてNasdaq全体（yfinanceは全Nasdaqの関数を提供）
     try:
         if any(k in ("nasdaq100", "nasdaq") for k in keys):
-            for t in yf.tickers_nasdaq():
+            for t in yf.Tickers().nasdaq:
                 rows.append((t, "", "nasdaq_all"))
     except Exception:
         pass
