@@ -30,6 +30,7 @@ jobs:
           pip install pandas numpy requests tqdm pyarrow yfinance
           which zip || (sudo apt-get update && sudo apt-get install -y zip)
           which dos2unix || (sudo apt-get update && sudo apt-get install -y dos2unix)
+          which timeout || (sudo apt-get update && sudo apt-get install -y coreutils)
 
       - name: Smoke test env
         shell: bash
@@ -42,16 +43,18 @@ jobs:
           set -euo pipefail
           mkdir -p data
 
-          # --- ダウンロード関数：本番URL → ミラーURL の順で試行、サイズ検証も実施 ---
+          # --- ダウンロード関数：ミラー優先（www → ftp）、HTTP/HTTPS 両方、短いリトライ＋ハードタイムアウト ---
           fetch_file() {
             local out="$1" ; shift
             local urls=("$@")
             local ok=0
             for u in "${urls[@]}"; do
               echo "[fetch] $u -> $out"
-              # --retry はネットワーク一時失敗に対処、-f は4xx/5xxで非ゼロ終了
-              if curl -fsS --retry 5 --retry-delay 2 --retry-connrefused -o "$out" "$u"; then
-                # CRLF を LF へ、ゼロ長や極端に小さいファイルを弾く（2KB未満は異常とみなす）
+              # 例外時もダラダラ待たない：接続 8s / 全体 25s の上限、リトライ 2 回
+              if timeout 40s curl -fsS \
+                   --connect-timeout 8 --max-time 25 \
+                   --retry 2 --retry-delay 2 --retry-all-errors \
+                   -o "$out" "$u"; then
                 dos2unix "$out" >/dev/null 2>&1 || true
                 local sz
                 sz=$(wc -c < "$out" || echo 0)
@@ -72,14 +75,26 @@ jobs:
             fi
           }
 
-          # 本番URL と ミラーURL（同一中身）を用意
-          NAS_MAIN="https://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
-          NAS_MIRR="https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
-          OTH_MAIN="https://ftp.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
-          OTH_MIRR="https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
+          # URL 候補（ミラー優先 → ftp、HTTPS/HTTP の順）
+          NAS_URLS=(
+            "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
+            "http://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
+            "https://nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
+            "http://nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
+            "https://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
+            "http://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
+          )
+          OTH_URLS=(
+            "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
+            "http://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
+            "https://nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
+            "http://nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
+            "https://ftp.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
+            "http://ftp.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
+          )
 
-          fetch_file "data/nasdaqlisted.txt" "$NAS_MAIN" "$NAS_MIRR"
-          fetch_file "data/otherlisted.txt"  "$OTH_MAIN" "$OTH_MIRR"
+          fetch_file "data/nasdaqlisted.txt" "${NAS_URLS[@]}"
+          fetch_file "data/otherlisted.txt"  "${OTH_URLS[@]}"
 
           echo "[head] nasdaqlisted.txt:"
           head -n 3 data/nasdaqlisted.txt || true
@@ -134,7 +149,8 @@ jobs:
                 print(f"[error] reading otherlisted.txt: {e}", file=sys.stderr)
                 raise
 
-            valid_ex = {"N","A","P"}  # N:NYSE, A:NYSE MKT(AMEX), P:NYSE ARCA（Cboe/BATS "Z" は除外）
+            # N:NYSE, A:NYSE MKT(AMEX), P:NYSE ARCA（Cboe/BATS "Z" などは除外）
+            valid_ex = {"N","A","P"}
             oth = oth[(oth["etf"]=="N") & (oth["test"]=="N") & (oth["exch"].isin(valid_ex))]
             oth["exchange"] = oth["exch"]
 
