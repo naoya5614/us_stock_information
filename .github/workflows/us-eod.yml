@@ -43,14 +43,13 @@ jobs:
           set -euo pipefail
           mkdir -p data
 
-          # --- ダウンロード関数：ミラー優先（www → ftp）、HTTP/HTTPS 両方、短いリトライ＋ハードタイムアウト ---
+          # --- ダウンロード関数：ミラー優先（www → apex → ftp）、HTTP/HTTPS 両方、短いリトライ＋ハードタイムアウト ---
           fetch_file() {
             local out="$1" ; shift
             local urls=("$@")
             local ok=0
             for u in "${urls[@]}"; do
               echo "[fetch] $u -> $out"
-              # 例外時もダラダラ待たない：接続 8s / 全体 25s の上限、リトライ 2 回
               if timeout 40s curl -fsS \
                    --connect-timeout 8 --max-time 25 \
                    --retry 2 --retry-delay 2 --retry-all-errors \
@@ -75,7 +74,6 @@ jobs:
             fi
           }
 
-          # URL 候補（ミラー優先 → ftp、HTTPS/HTTP の順）
           NAS_URLS=(
             "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
             "http://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
@@ -101,75 +99,77 @@ jobs:
           echo "[head] otherlisted.txt:"
           head -n 3 data/otherlisted.txt || true
 
-          # --- pandas で正規化・フィルタ（※インデント維持、先頭12スペースを削って Python に渡す） ---
-          cat <<'PY' | sed -E 's/^[[:space:]]{12}//' | python -
-            import pandas as pd, re, pathlib, sys
+          # --- Python スクリプトに書き出して実行（インデントの影響を完全排除） ---
+          cat > build_universe.py <<'PY'
+import pandas as pd, re, pathlib, sys
 
-            NAS_COLS = ["Symbol","Security Name","Test Issue","ETF","NextShares"]
-            OTH_COLS = ["ACT Symbol","Security Name","Exchange","Test Issue","ETF"]
+NAS_COLS = ["Symbol","Security Name","Test Issue","ETF","NextShares"]
+OTH_COLS = ["ACT Symbol","Security Name","Exchange","Test Issue","ETF"]
 
-            try:
-                nas = pd.read_csv(
-                    "data/nasdaqlisted.txt",
-                    sep="|",
-                    usecols=NAS_COLS,
-                    dtype=str,
-                    engine="python",
-                    skipfooter=1     # "File Creation Time" のフッター行を除去
-                ).rename(columns={
-                    "Symbol":"ticker",
-                    "Security Name":"name",
-                    "Test Issue":"test",
-                    "ETF":"etf",
-                    "NextShares":"next"
-                })
-            except Exception as e:
-                print(f"[error] reading nasdaqlisted.txt: {e}", file=sys.stderr)
-                raise
+try:
+    nas = pd.read_csv(
+        "data/nasdaqlisted.txt",
+        sep="|",
+        usecols=NAS_COLS,
+        dtype=str,
+        engine="python",
+        skipfooter=1     # "File Creation Time" のフッター行を除去
+    ).rename(columns={
+        "Symbol":"ticker",
+        "Security Name":"name",
+        "Test Issue":"test",
+        "ETF":"etf",
+        "NextShares":"next"
+    })
+except Exception as e:
+    print(f"[error] reading nasdaqlisted.txt: {e}", file=sys.stderr)
+    raise
 
-            nas = nas[(nas["etf"]=="N") & (nas["next"]=="N") & (nas["test"]=="N")]
-            nas["exchange"] = "NASDAQ"
+nas = nas[(nas["etf"]=="N") & (nas["next"]=="N") & (nas["test"]=="N")]
+nas["exchange"] = "NASDAQ"
 
-            try:
-                oth = pd.read_csv(
-                    "data/otherlisted.txt",
-                    sep="|",
-                    usecols=OTH_COLS,
-                    dtype=str,
-                    engine="python",
-                    skipfooter=1
-                ).rename(columns={
-                    "ACT Symbol":"ticker",
-                    "Security Name":"name",
-                    "Exchange":"exch",
-                    "Test Issue":"test",
-                    "ETF":"etf"
-                })
-            except Exception as e:
-                print(f"[error] reading otherlisted.txt: {e}", file=sys.stderr)
-                raise
+try:
+    oth = pd.read_csv(
+        "data/otherlisted.txt",
+        sep="|",
+        usecols=OTH_COLS,
+        dtype=str,
+        engine="python",
+        skipfooter=1
+    ).rename(columns={
+        "ACT Symbol":"ticker",
+        "Security Name":"name",
+        "Exchange":"exch",
+        "Test Issue":"test",
+        "ETF":"etf"
+    })
+except Exception as e:
+    print(f"[error] reading otherlisted.txt: {e}", file=sys.stderr)
+    raise
 
-            # N:NYSE, A:NYSE MKT(AMEX), P:NYSE ARCA（Cboe/BATS "Z" などは除外）
-            valid_ex = {"N","A","P"}
-            oth = oth[(oth["etf"]=="N") & (oth["test"]=="N") & (oth["exch"].isin(valid_ex))]
-            oth["exchange"] = oth["exch"]
+# N:NYSE, A:NYSE MKT(AMEX), P:NYSE ARCA（Cboe/BATS "Z" などは除外）
+valid_ex = {"N","A","P"}
+oth = oth[(oth["etf"]=="N") & (oth["test"]=="N") & (oth["exch"].isin(valid_ex))]
+oth["exchange"] = oth["exch"]
 
-            df = pd.concat(
-                [nas[["ticker","name","exchange"]], oth[["ticker","name","exchange"]]],
-                ignore_index=True
-            )
+df = pd.concat(
+    [nas[["ticker","name","exchange"]], oth[["ticker","name","exchange"]]],
+    ignore_index=True
+)
 
-            # ワラント/権利/ユニット等を名称で除外（簡易）
-            pat = re.compile(r"\b(Warrant|Warrants|Rt|Right|Rights|Units?)\b", re.IGNORECASE)
-            df = df[~df["name"].fillna("").str.contains(pat, na=False)]
+# ワラント/権利/ユニット等を名称で除外（簡易）
+pat = re.compile(r"\b(Warrant|Warrants|Rt|Right|Rights|Units?)\b", re.IGNORECASE)
+df = df[~df["name"].fillna("").str.contains(pat, na=False)]
 
-            # TICKER 正規化 & 重複排除
-            df["ticker"] = df["ticker"].astype(str).str.strip().str.upper()
-            df = df.drop_duplicates(subset=["ticker"]).reset_index(drop=True)
+# TICKER 正規化 & 重複排除
+df["ticker"] = df["ticker"].astype(str).str.strip().str.upper()
+df = df.drop_duplicates(subset=["ticker"]).reset_index(drop=True)
 
-            pathlib.Path("data/universe.csv").write_text(df.to_csv(index=False), encoding="utf-8")
-            print(f"[universe-csv] rows={len(df)}  sample={df['ticker'].head(10).tolist()}")
-          PY
+pathlib.Path("data/universe.csv").write_text(df.to_csv(index=False), encoding="utf-8")
+print(f"[universe-csv] rows={len(df)}  sample={df['ticker'].head(10).tolist()}")
+PY
+
+          python3 build_universe.py
 
       # === レポート実行（EOD／上位流動性N銘柄、ユニバースは上のCSV、データ源は yf→tiingo→alphav） ===
       - name: Run report (EOD, top-liquidity, CSV universe, yf→tiingo→alphav)
