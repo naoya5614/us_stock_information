@@ -3,7 +3,7 @@ set -euo pipefail
 
 mkdir -p data
 
-# ミラー優先（www → apex → ftp）、HTTP/HTTPS 両方、短いリトライ＋ハードタイムアウト
+# --- ダウンロード関数：ミラー優先（www → apex → ftp）、HTTP/HTTPS 両方、短いリトライ＋ハードタイムアウト ---
 fetch_file() {
   local out="$1" ; shift
   local urls=("$@")
@@ -14,7 +14,9 @@ fetch_file() {
          --connect-timeout 8 --max-time 25 \
          --retry 2 --retry-delay 2 --retry-all-errors \
          -o "$out" "$u"; then
-      dos2unix "$out" >/dev/null 2>&1 || true
+      # 改行コード整形（あれば）
+      if command -v dos2unix >/dev/null 2>&1; then dos2unix "$out" >/dev/null 2>&1 || true; fi
+      # サイズが極端に小さいファイルは不正として扱う
       local sz
       sz=$(wc -c < "$out" || echo 0)
       if [ "$sz" -ge 2048 ]; then
@@ -42,6 +44,7 @@ NAS_URLS=(
   "https://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
   "http://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
 )
+
 OTH_URLS=(
   "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
   "http://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
