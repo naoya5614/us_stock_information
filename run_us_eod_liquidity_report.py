@@ -8,20 +8,9 @@ EOD（前日終値）×上位流動性N銘柄の一括取得→分析→A〜F出
 - 確定N銘柄に対して coverage=100% を担保（未取得銘柄は集合から外す）
 - すべてEODベース（リアルタイム/時間外は未取得）
 - ユニバースは --universe_source （既定 "yf"）で構築。FORCE_UNIVERSE_SOURCE で上書き可。
-
-出力（--outdir 配下）:
- A) market_summary.txt
- B) prices_us_all.csv
- C) coverage_report_us.csv
- D) data_info_us.txt
- E) stock_analysis_us.csv
- F) stock_alerts_us.txt
- 参考) security_master_us.parquet (pyarrowあり) / .csv (代替)
-
-依存: pandas numpy requests tqdm pyarrow(任意) yfinance
 """
 
-import os, sys, time, argparse, math, random
+import os, sys, time, argparse, math, random, re
 from datetime import datetime as dt, timedelta, timezone
 from typing import List, Tuple, Optional, Dict
 
@@ -33,9 +22,9 @@ from tqdm import tqdm
 
 # ---------- 基本設定 ----------
 DEFAULT_OUTDIR = "./out"
-DEFAULT_N = 3000
-CAL_DAYS_BACK = 200          # 成功率重視（十分な分析長）
-SPY_SYMBOL = "SPY"          # RS/βのベンチマーク
+DEFAULT_N = 4000
+CAL_DAYS_BACK = 200
+SPY_SYMBOL = "SPY"
 JST = timezone(timedelta(hours=9))
 
 # ---------- ユーティリティ ----------
@@ -84,10 +73,6 @@ def normalize_price_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
 
 # ---------- ユニバース ----------
 def hydrate_universe_from_yf(keys: List[str]) -> pd.DataFrame:
-    """
-    yfinance の内蔵一覧を使ってユニバースを組む。
-    大母集団: sp500, dow30, nasdaq（全）＋ nasdaq100 シード（冗長でもOK）
-    """
     rows = []
     try:
         if any(k in ("sp500","s&p500") for k in keys):
@@ -103,7 +88,6 @@ def hydrate_universe_from_yf(keys: List[str]) -> pd.DataFrame:
         pass
     try:
         if any(k in ("nasdaq","nasdaq_all") for k in keys):
-            # 数千銘柄が返ることがある
             for t in yf.tickers_nasdaq():
                 rows.append((t, "", "nasdaq_all"))
     except Exception:
@@ -115,13 +99,25 @@ def hydrate_universe_from_yf(keys: List[str]) -> pd.DataFrame:
         rows.extend([(t,"","nasdaq100_seed") for t in extra])
 
     if not rows:
-        # 最低限のフォールバック
         seed = ["AAPL","MSFT","NVDA","AMZN","GOOGL","GOOG","META","TSLA","AVGO","BRK-B","UNH","JPM","XOM","V","PG","MA"]
         rows = [(t, "", "seed_top_liquidity") for t in seed]
 
     df = pd.DataFrame(rows, columns=["ticker","name","list_source"]).drop_duplicates("ticker")
     df["ticker"] = df["ticker"].astype(str).str.strip().str.upper()
     return df.reset_index(drop=True)
+
+def hydrate_universe_from_file(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    assert "ticker" in df.columns
+    if "name" not in df.columns:
+        df["name"] = ""
+    if "exchange" not in df.columns:
+        df["exchange"] = ""
+    # ETF/権利/ユニットっぽいものを一応弾く（YAML側でも除外済みだが二重化）
+    pat = re.compile(r"\b(Warrant|Rt|Right|Units?)\b", re.IGNORECASE)
+    df = df[~df.get("name","").astype(str).str.contains(pat)]
+    df["ticker"] = df["ticker"].astype(str).str.strip().str.upper()
+    return df[["ticker","name","exchange"]].drop_duplicates("ticker").reset_index(drop=True)
 
 def build_universe(keys: List[str], source_order: List[str]) -> pd.DataFrame:
     last_err = None
@@ -131,13 +127,7 @@ def build_universe(keys: List[str], source_order: List[str]) -> pd.DataFrame:
                 return hydrate_universe_from_yf(keys)
             elif src.startswith("file:"):
                 path = src.split("file:",1)[1]
-                df = pd.read_csv(path)
-                assert "ticker" in df.columns
-                if "name" not in df.columns:
-                    df["name"] = ""
-                df["list_source"] = "file"
-                df["ticker"] = df["ticker"].astype(str).str.strip().str.upper()
-                return df[["ticker","name","list_source"]].drop_duplicates("ticker").reset_index(drop=True)
+                return hydrate_universe_from_file(path)
         except Exception as e:
             last_err = e
             continue
@@ -194,16 +184,10 @@ def _yf_bulk_once(tickers: List[str], start: str, end_plus: str, chunk_size: int
                     out[batch[0]] = df
         except Exception:
             pass
-        time.sleep(sleep_s + random.random()*0.6)  # ジッタでレート制限回避
+        time.sleep(sleep_s + random.random()*0.6)
     return out
 
 def yf_bulk_multi_pass(tickers: List[str], start: str, end: str) -> Dict[str, pd.DataFrame]:
-    """
-    3パスで段階的に成功率を上げる。
-     - Pass1: chunk=60, sleep=1.6s, threads=False（安定志向）
-     - Pass2: chunk=40, sleep=2.2s, threads=False（さらに厳しめ）
-     - Pass3: 残りを個別 dl（最終砦）
-    """
     out: Dict[str, pd.DataFrame] = {}
     end_plus = (pd.to_datetime(end) + timedelta(days=1)).strftime("%Y-%m-%d")
 
@@ -211,18 +195,15 @@ def yf_bulk_multi_pass(tickers: List[str], start: str, end: str) -> Dict[str, pd
     if not remain:
         return out
 
-    # Pass1
     got = _yf_bulk_once(remain, start, end_plus, chunk_size=60, sleep_s=1.6, threads=False)
     out.update(got)
     remain = [t for t in remain if t not in out]
 
-    # Pass2（不足のみ再挑戦）
     if remain:
         got = _yf_bulk_once(remain, start, end_plus, chunk_size=40, sleep_s=2.2, threads=False)
         out.update(got)
         remain = [t for t in remain if t not in out]
 
-    # Pass3（個別）
     for t in tqdm(remain, desc="yfinance single (final fill)", ncols=90):
         try:
             df = yf.download(t, start=start, end=end_plus, interval="1d", auto_adjust=False, progress=False, threads=False)
@@ -363,7 +344,7 @@ def main():
         uni_df.to_csv(sm_csv, index=False)
         master_saved_as = "csv"
 
-    # 2) SPY（信頼確保のため yfinance → Stooq → AV）
+    # 2) SPY（yfinance → Stooq → AV）
     spy_df = None
     for getter in (lambda: yf_bulk_multi_pass([SPY_SYMBOL], start_date, end_date).get(SPY_SYMBOL),
                    lambda: stooq_daily(SPY_SYMBOL, start_date, end_date),
@@ -377,19 +358,17 @@ def main():
     spy["mkt_ret"] = spy["close"].pct_change()
     spy_m = spy[["date","mkt_ret","close"]].rename(columns={"close":"spy_close"}).copy()
 
-    # 3) 価格取得（yfinance 多段 → Stooq → Tiingo → AV）
+    # 3) 価格取得
     fetched: Dict[str, pd.DataFrame] = {}
     used_src: Dict[str, str] = {}
     tickers = [t for t in uni_df["ticker"].tolist() if t.upper() != SPY_SYMBOL]
 
-    # 3-1 yfinance（多段バルク＋個別最終砦）
     if "yf" in order:
         yf_res = yf_bulk_multi_pass(tickers, start_date, end_date)
         for t, df in yf_res.items():
             fetched[t] = df; used_src[t] = "yf"
         print(f"[fetch] yfinance ok: {sum(1 for v in used_src.values() if v=='yf')}")
 
-    # 3-2 Stooq（不足のみ）
     missing = [t for t in tickers if t not in fetched]
     if missing and "stooq" in order:
         for t in tqdm(missing, desc="Stooq (missing only)", ncols=90):
@@ -399,17 +378,15 @@ def main():
             time.sleep(0.02)
         print(f"[fetch] Stooq ok (added): {sum(1 for v in used_src.values() if v=='stooq')}")
 
-    # 3-3 Tiingo（さらに不足）
     missing = [t for t in tickers if t not in fetched]
     if missing and "tiingo" in order:
-        cap = len(missing)  # 必要なら制限
+        cap = len(missing)
         for t in tqdm(missing[:cap], desc="Tiingo (missing only)", ncols=90):
             df = tiingo_daily(t, tiingo_token, start_date, end_date)
             if df is not None and not df.empty:
                 fetched[t] = df; used_src[t] = "tiingo"
         print(f"[fetch] Tiingo ok (added): {sum(1 for v in used_src.values() if v=='tiingo')}")
 
-    # 3-4 AlphaVantage（最後、上限抑制）
     missing = [t for t in tickers if t not in fetched]
     if missing and "alphav" in order:
         cap = min(500, len(missing))
@@ -422,15 +399,13 @@ def main():
     total_ok = len(fetched)
     print(f"[fetch] total ok: {total_ok} / {len(tickers)}")
 
-    # 重要: 1000件未満なら不足分を再サンプリング（nasdaq全体から追加）→再走査
     if total_ok < 1000:
         print(f"[boost] fetched={total_ok} < 1000 → 再サンプリング＆再取得を実施")
-        # nasdaq大母集団からランダム1,500件追加して再取得
         try:
-            base = hydrate_universe_from_yf(["nasdaq"])
-            extra = [t for t in base["ticker"].tolist() if t not in fetched][:5000]
+            # すでにYAMLで巨大ユニバース供給済みの想定だが、念のため再走査
+            extra = [t for t in tickers if t not in fetched][:5000]
             random.shuffle(extra)
-            extra = extra[:1500]
+            extra = extra[:2000]
             new = yf_bulk_multi_pass(extra, start_date, end_date)
             for t, df in new.items():
                 if t not in fetched:
@@ -443,13 +418,13 @@ def main():
     if not fetched:
         raise RuntimeError("EODを取得できた銘柄がありません。レート制限/ネットワーク/依存関係をご確認ください。")
 
-    # 4) ADV20 Notional → N選定（“取得できた集合”に対して）
+    # 4) ADV20 Notional → N選定
     rows = []
     for t, df in fetched.items():
         adv20 = df["volume"].tail(20).mean() if len(df) >= 20 else np.nan
         lc = df["close"].iloc[-1]
         adv20_notional = float(adv20) * float(lc) if pd.notna(adv20) else np.nan
-        nm = ""  # nameは未取得：空に
+        nm = ""
         rows.append([t, nm, lc, adv20, adv20_notional, used_src.get(t,"")])
     basic = pd.DataFrame(rows, columns=["ticker","name","last_close","adv20_shares","adv20_notional","src"]).dropna(subset=["adv20_notional"])
     basic = basic.sort_values("adv20_notional", ascending=False).reset_index(drop=True)
@@ -465,27 +440,22 @@ def main():
         if "adjClose" in df.columns and df["adjClose"].notna().any():
             df["close"] = df["adjClose"].fillna(df["close"])
 
-        # EMA/ATR
         df["ema20"]  = ema(df["close"], 20)
         df["ema50"]  = ema(df["close"], 50)
         df["ema200"] = ema(df["close"], 200)
         df["atr14"]  = atr(df, 14)
 
-        # リターン
         for n in [1,5,20,60,120,252]:
             df[f"r_{n}d"] = df["close"].pct_change(n)*100.0
 
-        # 年率ボラ、ATR%
         df["vol_20d_ann"] = ann_vol_from_close(df, 20)
         df["atr14_pct"]   = (df["atr14"]/df["close"])*100.0
 
-        # 52週距離
         df["hh_52w"] = df["close"].rolling(252, min_periods=1).max()
         df["ll_52w"] = df["close"].rolling(252, min_periods=1).min()
         df["dist_52w_high"] = (df["close"]/df["hh_52w"] - 1.0)*100.0
         df["dist_52w_low"]  = (df["close"]/df["ll_52w"] - 1.0)*100.0
 
-        # βとR^2（60d）
         df["ret"] = df["close"].pct_change()
         merged = pd.merge(df[["date","ret"]], spy_m[["date","mkt_ret"]], on="date", how="inner")
         beta_s, r2_s = beta_and_r2(merged["ret"], merged["mkt_ret"], 60)
@@ -493,15 +463,12 @@ def main():
         merged["beta_r2"] = r2_s
         df = pd.merge(df, merged[["date","beta_60d_vs_SPY","beta_r2"]], on="date", how="left")
 
-        # パターン
         df["inside_day"] = inside_day(df)
         df["NR7"] = nr7(df)
 
-        # 出来高異常
         df["adv20_shares"] = df["volume"].rolling(20).mean()
         df["vol_spike"]    = df["volume"] / df["adv20_shares"]
 
-        # シグナル
         last = df.iloc[-1]
         prev = df.iloc[-2] if len(df)>=2 else None
         if pd.notna(last["ema20"]) and pd.notna(last["ema50"]):
@@ -526,11 +493,9 @@ def main():
             signal, "EOD", 0, "", dt.utcnow().strftime("%Y-%m-%d")
         ])
 
-        # RS(12w)→パーセンタイル化は後段
+        # RS(12w)：spy_m を使用（spy_closeはspy_mにのみ存在）
+        tmp = pd.merge(df[["date","close"]], spy_m[["date","spy_close"]], on="date", how="inner")
         rs_12w_score = np.nan
-        tmp = pd.merge(df[["date","close"]], spy[["date","spy_close"]].rename(columns={"spy_close":"spy_close"}), on="date", how="inner")
-        # 上のrenameは冗長だが可読性のため残す
-        tmp = pd.merge(df[["date","close"]], spy[["date","spy_close"]], on="date", how="inner")
         if len(tmp) >= 60:
             tmp["rel"] = (tmp["close"]/tmp["spy_close"]) / (tmp["close"].shift(60)/tmp["spy_close"].shift(60)) - 1.0
             rs_12w_score = tmp["rel"].iloc[-1] * 100.0
@@ -563,8 +528,7 @@ def main():
             new_high_20d,
             new_low_20d,
             float(last.get("vol_spike", np.nan)) if pd.notna(last.get("vol_spike", np.nan)) else "",
-            # βは上の merged を直接使うと安全だが簡略化
-            np.nan,  # beta_60d_vs_SPY（簡略。必要なら再計算可）
+            np.nan,  # beta_60d_vs_SPY（必要なら詳細再計算可）
             np.nan,  # beta_r2
             "unknown",
             "", "", "",
@@ -585,7 +549,7 @@ def main():
                      "comp_score","risk_band","analysis_note","inside_day","NR7"]
     analysis_df = pd.DataFrame(analysis_rows, columns=analysis_cols)
 
-    # rs_12w_percentile：全体ランクに変換
+    # rs_12w_percentile：全体ランクへ
     vals = pd.to_numeric(analysis_df["rs_12w_percentile"], errors="coerce")
     ranks = vals.rank(pct=True) * 100.0
     analysis_df["rs_12w_percentile"] = ranks.round(2)
@@ -604,13 +568,11 @@ def main():
     comp_norm = pd.Series(50.0, index=comp.index) if comp.max()==comp.min() else ((comp - comp.min())/(comp.max()-comp.min())*100.0)
     analysis_df["comp_score"] = comp_norm.round(1)
 
-    # risk_band（三分位）
     try:
         analysis_df["risk_band"] = pd.qcut(pd.to_numeric(analysis_df["vol_20d_ann"], errors="coerce"), 3, labels=["Low","Med","High"]).astype(str)
     except Exception:
         analysis_df["risk_band"] = ""
 
-    # analysis_note
     notes = []
     for _, r in analysis_df.iterrows():
         note = []
@@ -672,7 +634,7 @@ def main():
         "rows_returned": int(len(prices_df)),
         "coverage_pct": float(100.0 if len(prices_df)>0 else 0.0),
         "missing_symbols": "",
-        "data_source_notes": f"fetch_order={order}; universe_source={uni_src_order}; master_saved_as={master_saved_as}"
+        "data_source_notes": f"fetch_order={order}; universe_source={uni_src_order}; master_saved_as={'parquet' if os.path.exists(os.path.join(outdir,'security_master_us.parquet')) else 'csv'}"
     }])
     cov.to_csv(os.path.join(outdir, "coverage_report_us.csv"), index=False)
 

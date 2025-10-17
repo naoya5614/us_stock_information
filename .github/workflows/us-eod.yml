@@ -1,16 +1,17 @@
-name: US EOD Liquidity Report (1000+ target)
+name: US EOD Liquidity Report (Diag Safe)
 
 on:
-  workflow_dispatch: {}     # 手動でも回せる
+  workflow_dispatch: {}     # 手動実行用
   schedule:
-    - cron: '40 10 * * 1-5' # 19:40 JST (平日)
-    - cron: '00 11 * * 1-5' # 20:00 JST (平日)
+    - cron: '40 10 * * 1-5' # 19:40 JST（平日）※GitHub は UTC で動作
+    - cron: '00 11 * * 1-5' # 20:00 JST（平日）
 
 jobs:
   run:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -23,36 +24,161 @@ jobs:
       - name: Install dependencies
         shell: bash
         run: |
+          set -euo pipefail
           python -V
           python -m pip install --upgrade pip
           pip install pandas numpy requests tqdm pyarrow yfinance
+          which zip || (sudo apt-get update && sudo apt-get install -y zip)
+          which dos2unix || (sudo apt-get update && sudo apt-get install -y dos2unix)
 
       - name: Smoke test env
+        shell: bash
         run: "python -c 'import pandas, numpy, yfinance; print(\"OK: imports\")'"
 
-      - name: Run report (bulk+retry; 1000+ target)
+      # === 公式ディレクトリからユニバースCSVを構築（NYSE/Nasdaq の ACTIVE 普通株のみ） ===
+      - name: Build universe from official directories (Nasdaq Trader, robust)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data
+
+          # --- ダウンロード関数：本番URL → ミラーURL の順で試行、サイズ検証も実施 ---
+          fetch_file() {
+            local out="$1" ; shift
+            local urls=("$@")
+            local ok=0
+            for u in "${urls[@]}"; do
+              echo "[fetch] $u -> $out"
+              # --retry はネットワーク一時失敗に対処、-f は4xx/5xxで非ゼロ終了
+              if curl -fsS --retry 5 --retry-delay 2 --retry-connrefused -o "$out" "$u"; then
+                # CRLF を LF へ、ゼロ長や極端に小さいファイルを弾く（2KB未満は異常とみなす）
+                dos2unix "$out" >/dev/null 2>&1 || true
+                local sz
+                sz=$(wc -c < "$out" || echo 0)
+                if [ "$sz" -ge 2048 ]; then
+                  echo "[fetch] ok size=${sz} bytes"
+                  ok=1
+                  break
+                else
+                  echo "[fetch] too small (${sz} bytes), will try next URL"
+                fi
+              else
+                echo "[fetch] curl failed, trying next URL"
+              fi
+            done
+            if [ "$ok" -ne 1 ]; then
+              echo "::error::Failed to fetch $out from all mirrors"
+              exit 1
+            fi
+          }
+
+          # 本番URL と ミラーURL（同一中身）を用意
+          NAS_MAIN="https://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
+          NAS_MIRR="https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
+          OTH_MAIN="https://ftp.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
+          OTH_MIRR="https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
+
+          fetch_file "data/nasdaqlisted.txt" "$NAS_MAIN" "$NAS_MIRR"
+          fetch_file "data/otherlisted.txt"  "$OTH_MAIN" "$OTH_MIRR"
+
+          echo "[head] nasdaqlisted.txt:"
+          head -n 3 data/nasdaqlisted.txt || true
+          echo "[head] otherlisted.txt:"
+          head -n 3 data/otherlisted.txt || true
+
+          # --- pandas で正規化・フィルタ ---
+          python - <<'PY'
+            import pandas as pd, re, pathlib, sys
+
+                NAS_COLS = ["Symbol","Security Name","Test Issue","ETF","NextShares"]
+                OTH_COLS = ["ACT Symbol","Security Name","Exchange","Test Issue","ETF"]
+
+                try:
+                    nas = pd.read_csv(
+                        "data/nasdaqlisted.txt",
+                        sep="|",
+                        usecols=NAS_COLS,
+                        dtype=str,
+                        engine="python",
+                        skipfooter=1     # "File Creation Time" のフッター行を除去
+                    ).rename(columns={
+                        "Symbol":"ticker",
+                        "Security Name":"name",
+                        "Test Issue":"test",
+                        "ETF":"etf",
+                        "NextShares":"next"
+                    })
+                except Exception as e:
+                    print(f"[error] reading nasdaqlisted.txt: {e}", file=sys.stderr)
+                    raise
+
+                nas = nas[(nas["etf"]=="N") & (nas["next"]=="N") & (nas["test"]=="N")]
+                nas["exchange"] = "NASDAQ"
+
+                try:
+                    oth = pd.read_csv(
+                        "data/otherlisted.txt",
+                        sep="|",
+                        usecols=OTH_COLS,
+                        dtype=str,
+                        engine="python",
+                        skipfooter=1
+                    ).rename(columns={
+                        "ACT Symbol":"ticker",
+                        "Security Name":"name",
+                        "Exchange":"exch",
+                        "Test Issue":"test",
+                        "ETF":"etf"
+                    })
+                except Exception as e:
+                    print(f"[error] reading otherlisted.txt: {e}", file=sys.stderr)
+                    raise
+
+                valid_ex = {"N","A","P"}  # N:NYSE, A:NYSE MKT(AMEX), P:NYSE ARCA（Cboe/BATS "Z" は除外）
+                oth = oth[(oth["etf"]=="N") & (oth["test"]=="N") & (oth["exch"].isin(valid_ex))]
+                oth["exchange"] = oth["exch"]
+
+                df = pd.concat(
+                    [nas[["ticker","name","exchange"]], oth[["ticker","name","exchange"]]],
+                    ignore_index=True
+                )
+
+                # ワラント/権利/ユニット等を名称で除外（簡易）
+                pat = re.compile(r"\b(Warrant|Warrants|Rt|Right|Rights|Units?)\b", re.IGNORECASE)
+                df = df[~df["name"].fillna("").str.contains(pat, na=False)]
+
+                # TICKER 正規化 & 重複排除
+                df["ticker"] = df["ticker"].astype(str).str.strip().str.upper()
+                df = df.drop_duplicates(subset=["ticker"]).reset_index(drop=True)
+
+                pathlib.Path("data/universe.csv").write_text(df.to_csv(index=False), encoding="utf-8")
+                print(f"[universe-csv] rows={len(df)}  sample={df['ticker'].head(10).tolist()}")
+                PY
+
+      # === レポート実行（EOD／上位流動性N銘柄、ユニバースは上のCSV、データ源は yf→tiingo→alphav） ===
+      - name: Run report (EOD, top-liquidity, CSV universe, yf→tiingo→alphav)
         shell: bash
         env:
           TIINGO_API_TOKEN: ${{ secrets.TIINGO_API_TOKEN }}
           ALPHAVANTAGE_API_KEY: ${{ secrets.ALPHAVANTAGE_API_KEY }}
-          FORCE_UNIVERSE_SOURCE: "yf"   # wiki無効化の最終砦
         run: |
           set -euo pipefail
           TS=$(TZ=Asia/Tokyo date +%Y%m%d)
           mkdir -p out/$TS
-          # 期間短縮で成功率UP（EOD分析には十分）
           python run_us_eod_liquidity_report.py \
-            --N 3000 \
-            --since_days 200 \
-            --universe "sp500,dow30,nasdaq100,nasdaq" \
-            --universe_source "yf" \
-            --source_order "yf,stooq,tiingo,alphav" \
+            --N 1500 \
+            --since_days 560 \
+            --universe "sp500,nasdaq100,dow30,r1000,sp400,sp600" \
+            --universe_source "file:data/universe.csv" \
+            --source_order "yf,tiingo,alphav" \
             --outdir out/$TS
+          # 最新コピー
           rm -rf out/latest && mkdir -p out/latest && cp -r out/$TS/* out/latest/
 
       - name: Pack single ZIP
         shell: bash
         run: |
+          set -euo pipefail
           TS=$(TZ=Asia/Tokyo date +%Y%m%d)
           cd out && zip -rq ../us-eod-report-$TS.zip . && cd ..
           ls -lh us-eod-report-$TS.zip
