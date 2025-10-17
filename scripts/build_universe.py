@@ -1,91 +1,95 @@
-# scripts/build_universe.py
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Nasdaq Trader の公式ディレクトリ（nasdaqlisted.txt / otherlisted.txt）から
-NYSE / NYSE MKT(AMEX) / NYSE ARCA / NASDAQ の ACTIVE 普通株ユニバースを構築し、
-data/universe.csv を出力する。
-前段のワークフローで data/*.txt を取得済みであることが前提。
-"""
 
-import sys
-import re
-from pathlib import Path
 import pandas as pd
+import re
+import pathlib
+import sys
 
-NAS_PATH = Path("data/nasdaqlisted.txt")
-OTH_PATH = Path("data/otherlisted.txt")
-OUT_CSV  = Path("data/universe.csv")
+# 入力ファイル（scripts/fetch_symdirs.sh が保存）
+NAS_FILE = "data/nasdaqlisted.txt"
+OTH_FILE = "data/otherlisted.txt"
 
-if not NAS_PATH.exists() or not OTH_PATH.exists():
-    print("[error] missing nasdaqlisted.txt or otherlisted.txt", file=sys.stderr)
-    sys.exit(1)
-
+# 読み取り列
 NAS_COLS = ["Symbol", "Security Name", "Test Issue", "ETF", "NextShares"]
 OTH_COLS = ["ACT Symbol", "Security Name", "Exchange", "Test Issue", "ETF"]
 
-# NASDAQ 上場（ETF/NextShares/テスト除外）
-try:
-    nas = pd.read_csv(
-        NAS_PATH,
-        sep="|",
-        usecols=NAS_COLS,
-        dtype=str,
-        engine="python",
-        skipfooter=1,  # "File Creation Time" のフッター行を除去
-    ).rename(
-        columns={
-            "Symbol": "ticker",
-            "Security Name": "name",
-            "Test Issue": "test",
-            "ETF": "etf",
-            "NextShares": "next",
-        }
-    )
-except Exception as e:
-    print(f"[error] reading {NAS_PATH}: {e}", file=sys.stderr)
-    raise
+def read_nasdaq(path: str) -> pd.DataFrame:
+    try:
+        df = (
+            pd.read_csv(
+                path,
+                sep="|",
+                usecols=NAS_COLS,
+                dtype=str,
+                engine="python",
+                skipfooter=1,  # 末尾の "File Creation Time" 行を除去
+            )
+            .rename(
+                columns={
+                    "Symbol": "ticker",
+                    "Security Name": "name",
+                    "Test Issue": "test",
+                    "ETF": "etf",
+                    "NextShares": "next",
+                }
+            )
+        )
+    except Exception as e:
+        print(f"[error] reading nasdaqlisted.txt: {e}", file=sys.stderr)
+        raise
+    # ETF/Next/テスト除外
+    df = df[(df["etf"] == "N") & (df["next"] == "N") & (df["test"] == "N")]
+    df["exchange"] = "NASDAQ"
+    return df[["ticker", "name", "exchange"]]
 
-nas = nas[(nas["etf"] == "N") & (nas["next"] == "N") & (nas["test"] == "N")]
-nas["exchange"] = "NASDAQ"
+def read_otherlisted(path: str) -> pd.DataFrame:
+    try:
+        df = (
+            pd.read_csv(
+                path,
+                sep="|",
+                usecols=OTH_COLS,
+                dtype=str,
+                engine="python",
+                skipfooter=1,
+            )
+            .rename(
+                columns={
+                    "ACT Symbol": "ticker",
+                    "Security Name": "name",
+                    "Exchange": "exch",
+                    "Test Issue": "test",
+                    "ETF": "etf",
+                }
+            )
+        )
+    except Exception as e:
+        print(f"[error] reading otherlisted.txt: {e}", file=sys.stderr)
+        raise
+    # N:NYSE, A:NYSE MKT(AMEX), P:NYSE ARCA（Cboe/BATS "Z" などは除外）
+    valid_ex = {"N", "A", "P"}
+    df = df[(df["etf"] == "N") & (df["test"] == "N") & (df["exch"].isin(valid_ex))]
+    df["exchange"] = df["exch"]
+    return df[["ticker", "name", "exchange"]]
 
-# NYSE/ARCA/AMEX（ETF/テスト除外）
-try:
-    oth = pd.read_csv(
-        OTH_PATH,
-        sep="|",
-        usecols=OTH_COLS,
-        dtype=str,
-        engine="python",
-        skipfooter=1,
-    ).rename(
-        columns={
-            "ACT Symbol": "ticker",
-            "Security Name": "name",
-            "Exchange": "exch",
-            "Test Issue": "test",
-            "ETF": "etf",
-        }
-    )
-except Exception as e:
-    print(f"[error] reading {OTH_PATH}: {e}", file=sys.stderr)
-    raise
+def main():
+    nas = read_nasdaq(NAS_FILE)
+    oth = read_otherlisted(OTH_FILE)
+    df = pd.concat([nas, oth], ignore_index=True)
 
-valid_ex = {"N", "A", "P"}  # N:NYSE, A:NYSE MKT(AMEX), P:NYSE ARCA
-oth = oth[(oth["etf"] == "N") & (oth["test"] == "N") & (oth["exch"].isin(valid_ex))]
-oth["exchange"] = oth["exch"]
+    # ワラント/権利/ユニット等を名称で除外（簡易）
+    pat = re.compile(r"\b(Warrant|Warrants|Rt|Right|Rights|Units?)\b", re.IGNORECASE)
+    df = df[~df["name"].fillna("").str.contains(pat, na=False)]
 
-df = pd.concat(
-    [nas[["ticker", "name", "exchange"]], oth[["ticker", "name", "exchange"]]],
-    ignore_index=True,
-)
+    # TICKER 正規化 & 重複排除
+    df["ticker"] = df["ticker"].astype(str).str.strip().str.upper()
+    df = df.drop_duplicates(subset=["ticker"]).reset_index(drop=True)
 
-# ワラント/権利/ユニット等を名称で除外（簡易）
-pat = re.compile(r"\b(Warrant|Warrants|Rt|Right|Rights|Units?)\b", re.IGNORECASE)
-df = df[~df["name"].fillna("").str.contains(pat, na=False)]
+    out = pathlib.Path("data/universe.csv")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(df.to_csv(index=False), encoding="utf-8")
+    print(f"[universe-csv] rows={len(df)}  sample={df['ticker'].head(10).tolist()}")
 
-# TICKER 正規化 & 重複排除
-df["ticker"] = df["ticker"].astype(str).str.strip().str.upper()
-df = df.drop_duplicates(subset=["ticker"]).reset_index(drop=True)
-
-OUT_CSV.write_text(df.to_csv(index=False), encoding="utf-8")
-print(f"[universe-csv] rows={len(df)}  sample={df['ticker'].head(10).tolist()}")
+if __name__ == "__main__":
+    main()
