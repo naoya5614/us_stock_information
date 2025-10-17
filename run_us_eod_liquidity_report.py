@@ -1,12 +1,12 @@
-# run_us_eod_liquidity_report.py
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 EOD（前日終値）×上位流動性N銘柄の一括取得→分析→A〜F出力
-- フリー優先のフェイルオーバー: yfinance（一括/個別） → Tiingo → Alpha Vantage
+- フリー優先のフェイルオーバー: yfinance → Tiingo → Alpha Vantage
 - 取得できた銘柄の中から ADV20（出来高×終値）上位で N を確定
 - 確定N銘柄に対して coverage=100% を担保（未取得銘柄は集合から外す）
 - すべてEODベース（リアルタイム/時間外は未取得）
-- ユニバース取得元は --universe_source で制御（"wiki,yf" が既定）
+- ユニバース取得元は --universe_source で制御（"symboldir,yf" を推奨）
 
 出力（--outdir 配下）:
  A) market_summary.txt
@@ -20,9 +20,9 @@ EOD（前日終値）×上位流動性N銘柄の一括取得→分析→A〜F出
 依存: pandas numpy requests tqdm pyarrow(任意) yfinance
 """
 
-import os, sys, time, argparse
+import os, sys, time, math, argparse, io, re
 from datetime import datetime as dt, timedelta, timezone
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Optional, Dict
 
 import numpy as np
 import pandas as pd
@@ -34,10 +34,14 @@ from tqdm import tqdm
 DEFAULT_OUTDIR = "./out"
 DEFAULT_N = 1500
 CAL_DAYS_BACK = 560          # 約400営業日相当をカバー
-SPY_SYMBOL = "SPY"           # RS/βのベンチマーク
+SPY_SYMBOL = "SPY"          # RS/βのベンチマーク
 JST = timezone(timedelta(hours=9))
 
-# Wikipedia（候補プール用）
+# NASDAQ Trader Symbol Directory（公式）
+URL_NASDAQLISTED = "https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt"
+URL_OTHERLISTED  = "https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt"
+
+# Wikipedia（参考: 失敗しやすいので今回は使わない）
 WIKI_LISTS = {
     "sp500": "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
     "nasdaq100": "https://en.wikipedia.org/wiki/Nasdaq-100",
@@ -58,221 +62,222 @@ def robust_get(url: str, params=None, headers=None, timeout=30, retries=3, backo
     for i in range(retries):
         try:
             r = requests.get(url, params=params, headers=headers, timeout=timeout)
-            if r.status_code == 200:
+            if r.status_code == 200 and r.content:
                 return r
         except Exception:
             pass
         time.sleep(backoff * (i + 1))
     return None
 
-def flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
+# ---------- Symbol Directory 由来ユニバース ----------
+def _parse_symboldir(text: str) -> pd.DataFrame:
     """
-    列がMultiIndexでも必ず単層に丸める。('A','Close')->'A_Close' / ('Close',)->'Close'
+    NASDAQ Trader の '|' 区切りテキストをDataFrameへ。
+    ヘッダ行あり、末尾に 'File Creation Time:' 行があるので除去。
     """
-    if isinstance(df.columns, pd.MultiIndex):
-        new_cols = []
-        for tpl in df.columns.tolist():
-            if isinstance(tpl, tuple):
-                vals = [str(x) for x in tpl if str(x) != "" and x is not None]
-                new_cols.append("_".join(vals))
-            else:
-                new_cols.append(str(tpl))
-        df = df.copy()
-        df.columns = new_cols
+    lines = [ln.rstrip("\n") for ln in text.splitlines() if ln.strip() != ""]
+    if not lines:
+        return pd.DataFrame()
+    hdr = lines[0].split("|")
+    rows = []
+    for ln in lines[1:]:
+        if ln.startswith("File Creation Time"):
+            continue
+        rows.append(ln.split("|"))
+    df = pd.DataFrame(rows, columns=hdr)
     return df
 
-def force_plain(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    index/columns をフラット化し、'Date'→'date'等の標準列に正規化
-    """
-    df = flatten_columns(df)
-    if isinstance(df.index, pd.MultiIndex):
-        df = df.reset_index()
-    if "Date" in df.columns and "date" not in df.columns:
-        df = df.rename(columns={"Date":"date"})
-    if "Datetime" in df.columns and "date" not in df.columns:
-        df = df.rename(columns={"Datetime":"date"})
-    if "Adj Close" in df.columns and "adjClose" not in df.columns:
-        df = df.rename(columns={"Adj Close":"adjClose"})
-    stdmap = {"Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"}
-    for k,v in stdmap.items():
-        if k in df.columns and v not in df.columns:
-            df = df.rename(columns={k:v})
-    if "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
-    return df
+CLASS_SEP_PATTERN = re.compile(r"[.\s/]+")
 
-def parse_wiki_tickers(html: str) -> List[Tuple[str, str]]:
-    """Symbol/Company/Nameのテーブルをざっくり抽出→[(ticker, name)]"""
-    try:
-        tables = pd.read_html(html)
-    except ValueError:
-        return []
-    results = []
-    for df in tables:
-        cols = [str(c).lower() for c in df.columns]
-        if not any("symbol" in c for c in cols):
-            continue
-        name_idx = None
-        for key in ["security", "company", "name"]:
-            arr = [i for i, c in enumerate(cols) if key in c]
-            if arr:
-                name_idx = arr[0]; break
-        sym_idx = [i for i, c in enumerate(cols) if "symbol" in c]
-        if not sym_idx:
-            continue
-        sidx = sym_idx[0]
-        for _, row in df.iterrows():
-            try:
-                sym = str(row.iloc[sidx]).strip().replace(" ", "").upper()
-                if not sym or sym.lower() == "nan":
-                    continue
-                nm = ""
-                if name_idx is not None:
-                    nm = str(row.iloc[name_idx]).strip()
-                results.append((sym, nm))
-            except Exception:
+def normalize_ticker(raw: str) -> str:
+    if raw is None: return ""
+    t = str(raw).strip().upper()
+    t = CLASS_SEP_PATTERN.sub("-", t)          # ., /, space を '-' に
+    t = re.sub(r"-+", "-", t)
+    return t
+
+EXCLUDE_NAME_PATTERNS = [
+    r"\bETF\b", r"\bETN\b", r"\bEXCHANGE[- ]TRADED\b", r"\bCLOSED[- ]?END\b",
+    r"\bUNITS?\b", r"\bRIGHTS?\b", r"\bWARRANTS?\b",
+    r"\bPFD\b", r"\bPREFERRED\b", r"\bPERPETUAL PREFERRED\b",
+    r"\bWHEN[- ]ISSUED\b|\bWI\b", r"\bSPAC\b",
+    r"\bDEPOSITARY SHARE(S)? REPRESENTING .* PREFERRED",
+    r"\bNOTE(S)?\b.*EXCHANGE[- ]TRADED", r"\bFUND\b"
+]
+EXCLUDE_NAME_REGEX = re.compile("|".join(EXCLUDE_NAME_PATTERNS), re.IGNORECASE)
+
+INCLUDE_COMMON_REGEX = re.compile(
+    r"\bCOMMON STOCK\b|\bORDINARY SHARES?\b|\bCLASS [A-Z]\b.*\bCOMMON\b|\bAMERICAN DEPOSITARY SHARES?\b|\bADS\b",
+    re.IGNORECASE
+)
+
+def is_active_common_stock_symboldir(row: pd.Series) -> bool:
+    """
+    - Test Issue != Y
+    - ETF != Y
+    - 名前で Warrant / Right / Unit / Preferred / CEF/ETN / When-Issued / Test / Fund 等を除外
+    - Common/Ordinary/ADS を含むものは積極的に許容
+    """
+    name = str(row.get("Security Name", row.get("SecurityName", "")) or "")
+    test_issue = str(row.get("Test Issue", row.get("TestIssue", "N")) or "N").upper()
+    etf = str(row.get("ETF", "N") or "N").upper()
+
+    if test_issue == "Y": return False
+    if etf == "Y": return False
+    if EXCLUDE_NAME_REGEX.search(name):
+        # ただし Common/Ordinary/ADS を含む場合は精査
+        if INCLUDE_COMMON_REGEX.search(name):
+            if re.search(r"\bWARRANT|RIGHT|UNIT|PREFERRED\b", name, re.I):
+                return False
+            return True
+        return False
+    if INCLUDE_COMMON_REGEX.search(name):
+        return True
+    # 明示語がなくても、保守的に False（誤爆防止）
+    return False
+
+def hydrate_universe_from_symboldir() -> pd.DataFrame:
+    """
+    NASDAQ Trader 公式の nasdaqlisted.txt / otherlisted.txt からユニバース構築
+    """
+    rows = []
+
+    # Nasdaq 上場
+    r1 = robust_get(URL_NASDAQLISTED, timeout=45, retries=3, backoff=1.8)
+    if r1 is not None:
+        df1 = _parse_symboldir(r1.text)
+        # Nasdaqは 'Exchange' 列が無い → 'NASDAQ' を立てる
+        if not df1.empty:
+            df1["Exchange"] = "NASDAQ"
+    else:
+        df1 = pd.DataFrame()
+
+    # 他取引所（NYSE, NYSE American, NYSE Arca など）
+    r2 = robust_get(URL_OTHERLISTED, timeout=45, retries=3, backoff=1.8)
+    if r2 is not None:
+        df2 = _parse_symboldir(r2.text)
+    else:
+        df2 = pd.DataFrame()
+
+    if df1.empty and df2.empty:
+        raise RuntimeError("Symbol Directory 取得に失敗しました。ネットワーク/サイト状態をご確認ください。")
+
+    def cleanse(df, exch_hint_col="Exchange"):
+        if df is None or df.empty: return pd.DataFrame()
+        # シンボル列の推定
+        symbol_col = None
+        for c in df.columns:
+            if str(c).lower() in ("symbol","act symbol","cqssymbol","nasdaqsymbol","nasdaq symbol","ticker"):
+                symbol_col = c; break
+        if symbol_col is None:
+            symbol_col = df.columns[0]
+        out = []
+        for _, r in df.iterrows():
+            sym_raw = str(r.get(symbol_col, "")).strip()
+            if not sym_raw: continue
+            name = str(r.get("Security Name", r.get("SecurityName","")) or "")
+            if not is_active_common_stock_symboldir(r):  # フィルタ
                 continue
-    return results
+            t = normalize_ticker(sym_raw)
+            exch = str(r.get(exch_hint_col, "") or r.get("Exchange","") or "").strip().upper()
+            out.append((t, name, exch))
+        return pd.DataFrame(out, columns=["ticker","name","exchange"])
 
-def hydrate_universe_from_wiki(keys: List[str]) -> pd.DataFrame:
-    rows = []
-    for k in keys:
-        url = WIKI_LISTS.get(k)
-        if not url:
-            continue
-        r = robust_get(url, timeout=40)
-        if not r:
-            continue
-        pairs = parse_wiki_tickers(r.text)
-        for t, n in pairs:
-            rows.append((t, n, k))
-        time.sleep(1.0)
-    if not rows:
-        raise RuntimeError("Index lists fetch failed (Wikipedia).")
-    df = pd.DataFrame(rows, columns=["ticker","name","list_source"]).drop_duplicates("ticker")
-    df["ticker"] = df["ticker"].astype(str).str.strip().str.upper()
-    return df.reset_index(drop=True)
+    c1 = cleanse(df1, "Exchange")
+    c2 = cleanse(df2, "Exchange")
+    uni = pd.concat([c1, c2], ignore_index=True).drop_duplicates("ticker")
+    # 文字種最終整形
+    uni["ticker"] = uni["ticker"].str.upper().str.strip()
+    return uni.reset_index(drop=True)
 
-# ---------- yfinance ユニバース（強化版） ----------
+# ---------- yfinance 由来ユニバース（バックアップ） ----------
 def hydrate_universe_from_yf(keys: List[str]) -> pd.DataFrame:
+    """
+    yfinance 内蔵リスト。失敗しやすいため最終バックアップ用。
+    """
     rows = []
-    try:
-        if any(k in ("sp500", "s&p500") for k in keys):
-            arr = []
-            try:
-                arr = yf.tickers_sp500()
-            except Exception:
-                arr = []
-            for t in arr or []:
-                rows.append((t, "", "sp500"))
-    except Exception:
-        pass
-    try:
-        if any(k in ("dow30", "dow") for k in keys):
-            arr = []
-            try:
-                arr = yf.tickers_dow()
-            except Exception:
-                arr = []
-            for t in arr or []:
-                rows.append((t, "", "dow30"))
-    except Exception:
-        pass
-    try:
-        if any(k in ("nasdaq100", "nasdaq") for k in keys):
-            arr = []
-            try:
-                arr = yf.tickers_nasdaq()
-            except Exception:
-                arr = []
-            for t in (arr or [])[:2000]:
-                rows.append((t, "", "nasdaq_all"))
-    except Exception:
-        pass
+
+    def _safe(callable_fn):
+        try:
+            return list(callable_fn())
+        except Exception:
+            return []
+
+    if any(k in ("sp500","s&p500") for k in keys):
+        for t in _safe(yf.tickers_sp500):
+            rows.append((t, "", "sp500"))
+    if any(k in ("dow30","dow") for k in keys):
+        for t in _safe(yf.tickers_dow):
+            rows.append((t, "", "dow30"))
+    # 必要なら nasdaq 全体（巨大）も追加可能
+    if any(k in ("nasdaq","nasdaq100") for k in keys):
+        arr = _safe(yf.tickers_nasdaq)[:5000]   # 上限を5,000に緩和
+        for t in arr:
+            rows.append((t, "", "nasdaq_all"))
+
     if not rows:
+        # フォールバック種（前回はこれが発動して58銘柄だけになっていた）
         seed = [
-            "AAPL","MSFT","NVDA","AMZN","GOOGL","GOOG","META","TSLA","AVGO","BRK-B","UNH",
-            "JPM","XOM","JNJ","V","PG","MA","COST","HD","CVX","MRK","ABBV","PEP","KO",
+            "AAPL","MSFT","NVDA","AMZN","GOOGL","GOOG","META","TSLA","AVGO","BRK-B",
+            "UNH","JPM","XOM","JNJ","V","PG","MA","COST","HD","CVX","MRK","ABBV","PEP","KO",
             "BAC","PFE","TMO","ORCL","CSCO","WMT","NFLX","ADBE","CRM","AMD","INTC",
             "QCOM","TXN","IBM","NKE","MCD","WFC","CAT","LIN","UPS","PM","MS","AMGN",
             "HON","RTX","BLK","GS","SCHW","DE","GE","NOW","SHOP","SPY","QQQ"
         ]
         rows = [(t, "", "seed_top_liquidity") for t in seed]
-    df = pd.DataFrame(rows, columns=["ticker","name","list_source"]).drop_duplicates("ticker")
+
+    df = pd.DataFrame(rows, columns=["ticker","name","exchange"]).drop_duplicates("ticker")
     df["ticker"] = df["ticker"].astype(str).str.strip().str.upper()
     return df.reset_index(drop=True)
 
-# ---------- yfinance まとめ取り ----------
-def yf_batch_download(tickers: List[str], start: str, end: str) -> Dict[str, pd.DataFrame]:
-    out: Dict[str, pd.DataFrame] = {}
-    if not tickers:
-        return out
-    try:
-        data = yf.download(
-            tickers=tickers, start=start, end=end, interval="1d",
-            group_by="ticker", auto_adjust=False, threads=True, progress=False
-        )
-    except Exception:
-        return out
-    if data is None or len(data) == 0:
-        return out
-    # MultiIndex → 銘柄ごとに展開
-    if isinstance(data.columns, pd.MultiIndex):
-        for t in sorted({c[0] for c in data.columns}):
-            try:
-                sub = data[t].copy()
-                if sub is None or sub.empty:
-                    continue
-                sub = force_plain(sub.reset_index())
-                for c in ["open","high","low","close","volume","adjClose"]:
-                    if c not in sub.columns:
-                        sub[c] = np.nan
-                sub = sub.sort_values("date").reset_index(drop=True)
-                if not sub.empty and sub["close"].notna().any():
-                    out[t.upper()] = sub
-            except Exception:
-                continue
-    else:
-        # 単一銘柄のとき（保険）
-        sub = force_plain(data.reset_index())
-        for c in ["open","high","low","close","volume","adjClose"]:
-            if c not in sub.columns:
-                sub[c] = np.nan
-        sub = sub.sort_values("date").reset_index(drop=True)
-        if not sub.empty and sub["close"].notna().any():
-            out[tickers[0].upper()] = sub
-    return out
+# ---------- ユニバース統合 ----------
+def build_universe(keys: List[str], source_order: List[str]) -> pd.DataFrame:
+    """
+    source_order 例: ["symboldir","yf"] / ["yf"] / ["file:data/universe.csv"]
+    """
+    last_err = None
+    for src in source_order:
+        try:
+            if src == "symboldir":
+                return hydrate_universe_from_symboldir()
+            elif src == "yf":
+                return hydrate_universe_from_yf(keys)
+            elif src.startswith("file:"):
+                path = src.split("file:",1)[1]
+                df = pd.read_csv(path)
+                assert "ticker" in df.columns
+                if "name" not in df.columns:
+                    df["name"] = ""
+                if "exchange" not in df.columns:
+                    df["exchange"] = ""
+                df["ticker"] = df["ticker"].astype(str).str.strip().str.upper()
+                return df[["ticker","name","exchange"]].drop_duplicates("ticker").reset_index(drop=True)
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"Universe build failed. Last error: {last_err}")
 
 # ---------- データ取得（yfinance / Tiingo / AlphaVantage） ----------
 def yf_daily(ticker: str, start: str, end: str) -> Optional[pd.DataFrame]:
-    for attempt in range(2):
-        try:
-            df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=False, threads=False)
-            if df is None or df.empty:
-                tkr = yf.Ticker(ticker)
-                df = tkr.history(period="1y", interval="1d", auto_adjust=False)
-            if df is not None and not df.empty:
-                df = force_plain(df.reset_index())
-                for c in ["open","high","low","close","volume","adjClose"]:
-                    if c not in df.columns:
-                        df[c] = np.nan
-                return df.sort_values("date").reset_index(drop=True)
-        except Exception:
-            pass
-        time.sleep(1.0 + attempt)
-    return None
-
-def norm_for_tiingo_av(symbol: str) -> str:
-    return symbol.replace("-", ".")
+    try:
+        df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=False, threads=True)
+        if df is None or df.empty:
+            return None
+        df = df.reset_index().rename(columns={
+            "Date":"date","Open":"open","High":"high","Low":"low",
+            "Close":"close","Adj Close":"adjClose","Volume":"volume"
+        })
+        df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
+        return df.sort_values("date").reset_index(drop=True)
+    except Exception:
+        return None
 
 def tiingo_daily(ticker: str, token: Optional[str], start: str, end: str) -> Optional[pd.DataFrame]:
     if not token:
         return None
-    sym = norm_for_tiingo_av(ticker)
-    url = f"https://api.tiingo.com/tiingo/daily/{sym}/prices"
+    url = f"https://api.tiingo.com/tiingo/daily/{ticker}/prices"
     params = {"startDate": start, "endDate": end, "format": "json", "token": token}
-    r = robust_get(url, params=params, timeout=30, retries=3, backoff=1.7)
+    r = robust_get(url, params=params, timeout=30)
     if not r:
         return None
     try:
@@ -280,9 +285,7 @@ def tiingo_daily(ticker: str, token: Optional[str], start: str, end: str) -> Opt
         if not isinstance(data, list) or not data:
             return None
         df = pd.DataFrame(data)
-        df = force_plain(df)
-        if "date" in df.columns:
-            df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
+        df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
         for c in ["open","high","low","close","adjClose","volume"]:
             if c not in df.columns:
                 df[c] = np.nan
@@ -293,10 +296,9 @@ def tiingo_daily(ticker: str, token: Optional[str], start: str, end: str) -> Opt
 def alphav_daily_adj(ticker: str, apikey: Optional[str], start: str, end: str) -> Optional[pd.DataFrame]:
     if not apikey:
         return None
-    sym = norm_for_tiingo_av(ticker)
     url = "https://www.alphavantage.co/query"
-    params = {"function":"TIME_SERIES_DAILY_ADJUSTED","symbol":sym,"outputsize":"full","datatype":"json","apikey":apikey}
-    r = robust_get(url, params=params, timeout=45, retries=3, backoff=2.0)
+    params = {"function":"TIME_SERIES_DAILY_ADJUSTED","symbol":ticker,"outputsize":"full","datatype":"json","apikey":apikey}
+    r = robust_get(url, params=params, timeout=45)
     if not r:
         return None
     try:
@@ -304,19 +306,20 @@ def alphav_daily_adj(ticker: str, apikey: Optional[str], start: str, end: str) -
         ts = js.get("Time Series (Daily)", {})
         if not ts:
             return None
-        rows = [{
-            "date": pd.to_datetime(d),
-            "open": float(v.get("1. open", "nan")),
-            "high": float(v.get("2. high", "nan")),
-            "low": float(v.get("3. low", "nan")),
-            "close": float(v.get("4. close", "nan")),
-            "adjClose": float(v.get("5. adjusted close", "nan")),
-            "volume": float(v.get("6. volume", "nan")),
-        } for d, v in ts.items()]
+        rows = []
+        for d, v in ts.items():
+            rows.append({
+                "date": pd.to_datetime(d),
+                "open": float(v.get("1. open", "nan")),
+                "high": float(v.get("2. high", "nan")),
+                "low": float(v.get("3. low", "nan")),
+                "close": float(v.get("4. close", "nan")),
+                "adjClose": float(v.get("5. adjusted close", "nan")),
+                "volume": float(v.get("6. volume", "nan")),
+            })
         df = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
         mask = (df["date"] >= pd.to_datetime(start)) & (df["date"] <= pd.to_datetime(end))
         df = df.loc[mask].reset_index(drop=True)
-        df = force_plain(df)
         return df if not df.empty else None
     except Exception:
         return None
@@ -325,6 +328,7 @@ def fetch_prices_history(ticker: str, start: str, end: str,
                          tiingo_token: Optional[str],
                          alphav_key: Optional[str],
                          order: List[str]) -> Tuple[Optional[pd.DataFrame], str]:
+    """order例: ['yf','tiingo','alphav']"""
     for src in order:
         if src == "yf":
             df = yf_daily(ticker, start, end)
@@ -377,13 +381,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--N", type=int, default=DEFAULT_N, help="目標の上位流動性銘柄数（取得できた銘柄の中から確定）")
     ap.add_argument("--outdir", type=str, default=DEFAULT_OUTDIR, help="出力先ディレクトリ")
-    ap.add_argument("--universe", type=str, default="sp500,nasdaq100,dow30,r1000,sp400,sp600",
-                    help="候補プールに使う指数（カンマ区切り）")
+    ap.add_argument("--universe", type=str, default="sp500,nasdaq100,dow30",
+                    help="yfinanceバックアップ時の候補プールキー（カンマ区切り）")
     ap.add_argument("--since_days", type=int, default=CAL_DAYS_BACK, help="何日前までのEODを取るか（カレンダー日）")
     ap.add_argument("--source_order", type=str, default="yf,tiingo,alphav",
                     help="価格取得の優先順（例: 'yf,tiingo,alphav'）")
-    ap.add_argument("--universe_source", type=str, default="wiki,yf",
-                    help="ユニバース取得の優先順（例: 'wiki,yf' or 'yf' or 'file:data/universe.csv'）")
+    ap.add_argument("--universe_source", type=str, default="symboldir,yf",
+                    help="ユニバース取得の優先順（例: 'symboldir,yf' or 'yf' or 'file:data/universe.csv'）")
     args = ap.parse_args()
 
     outdir = args.outdir
@@ -392,9 +396,9 @@ def main():
     tiingo_token = os.getenv("TIINGO_API_TOKEN", "").strip() or None
     alphav_key   = os.getenv("ALPHAVANTAGE_API_KEY", "").strip() or None
     order = [s.strip() for s in args.source_order.split(",") if s.strip()]
-
-    # 既存 + 環境で上書き可能に
     uni_src_order = [s.strip() for s in args.universe_source.split(",") if s.strip()]
+
+    # 環境変数での強制上書きも許容
     env_uni = os.getenv("FORCE_UNIVERSE_SOURCE", "").strip()
     if env_uni:
         uni_src_order = [s.strip() for s in env_uni.split(",") if s.strip()]
@@ -403,14 +407,9 @@ def main():
     start_date = (dt.utcnow().date() - timedelta(days=args.since_days)).strftime("%Y-%m-%d")
     end_date   = dt.utcnow().date().strftime("%Y-%m-%d")
 
-    # yfinance history(period="1y") の保険として最低365日に丸め
-    if args.since_days < 365:
-        start_date = (dt.utcnow().date() - timedelta(days=365)).strftime("%Y-%m-%d")
-
-    # 1) 候補プール
+    # 1) 候補プール（ユニバース取得の順序に従う）
     idx_keys = [k.strip().lower() for k in args.universe.split(",") if k.strip()]
-    uni_df = build_universe(idx_keys, uni_src_order)  # ticker, name, list_source
-    print(f"[universe] source_order={uni_src_order}, size={len(uni_df)} (first 10) {uni_df['ticker'].head(10).tolist()}", file=sys.stderr)
+    uni_df = build_universe(idx_keys, uni_src_order)  # ticker, name, exchange
 
     # 保存（parquet優先）
     sm_parq = os.path.join(outdir, "security_master_us.parquet")
@@ -423,46 +422,32 @@ def main():
         uni_df.to_csv(sm_csv, index=False)
         master_saved_as = "csv"
 
+    print(f"[universe] source_order={uni_src_order}, size={len(uni_df)} (first 10) {uni_df['ticker'].head(10).tolist()}")
+
     # 2) SPY（ベンチマーク）
     spy_df, spy_src = fetch_prices_history(SPY_SYMBOL, start_date, end_date, tiingo_token, alphav_key, order)
     if spy_df is None or spy_df.empty:
         raise RuntimeError("SPYのEOD取得に失敗しました。ネットワーク/データ源をご確認ください。")
-    spy = force_plain(spy_df.sort_values("date").copy())
+    spy = spy_df.sort_values("date").copy()
     spy["mkt_ret"] = spy["close"].pct_change()
 
-    # 3) 各銘柄のEOD取得
+    # 3) 各銘柄のEOD取得（まず全候補を取れるだけ取り、後でADV20で上位Nに絞る）
     fetched: Dict[str, pd.DataFrame] = {}
     used_src: Dict[str, str] = {}
     tickers = [t for t in uni_df["ticker"].tolist() if t.upper() != SPY_SYMBOL]
 
-    # まず yfinance をバッチでまとめ取得（50銘柄ずつ）
-    batch_size = 50
-    for i in range(0, len(tickers), batch_size):
-        chunk = tickers[i:i+batch_size]
-        got = yf_batch_download(chunk, start_date, end_date)
-        for t, df in got.items():
-            fetched[t] = df
-            used_src[t] = "yf(batch)"
-        time.sleep(1.0)
-
-    # バッチで取れなかった残りは個別フェイルオーバー
-    for t in tqdm(tickers, desc="Fetching EOD (fallback)", ncols=90):
-        if t in fetched:
-            continue
+    for t in tqdm(tickers, desc="Fetching EOD", ncols=90):
         df, src = fetch_prices_history(t, start_date, end_date, tiingo_token, alphav_key, order)
         if df is None or df.empty:
-            df = yf_daily(t, start_date, end_date)  # 最後のhistory再試行
-            src = "yf(history)" if (df is not None and not df.empty) else src
-        if df is None or df.empty:
-            time.sleep(0.2)
             continue
-        df = force_plain(df)
-        if "date" not in df.columns or "close" not in df.columns:
+        need = {"date","open","high","low","close","volume"}
+        if not need.issubset(df.columns):
             continue
-        df = df.sort_values("date").reset_index(drop=True)
-        fetched[t] = df
+        df = df.dropna(subset=["close","high","low","volume"]).sort_values("date")
+        if df.empty:
+            continue
+        fetched[t] = df.reset_index(drop=True)
         used_src[t] = src
-        time.sleep(0.1)
 
     if not fetched:
         raise RuntimeError("EODを取得できた銘柄がありません。データ源やレート制限をご確認ください。")
@@ -470,7 +455,7 @@ def main():
     # 4) ADV20 Notionalを算出して上位Nを確定
     rows = []
     for t, df in fetched.items():
-        adv20 = df["volume"].tail(20).mean() if ("volume" in df.columns and len(df) >= 20) else np.nan
+        adv20 = df["volume"].tail(20).mean() if len(df) >= 20 else np.nan
         lc = df["close"].iloc[-1]
         adv20_notional = float(adv20) * float(lc) if pd.notna(adv20) else np.nan
         nm = uni_df.loc[uni_df["ticker"]==t, "name"]
@@ -481,19 +466,16 @@ def main():
 
     realized_N = min(args.N, len(basic))
     chosen = basic.head(realized_N)["ticker"].tolist()
+    chosen_set = set(chosen)
 
     # 5) 指標計算（選定N）
     prices_rows = []
     analysis_rows = []
 
-    # SPYと日付でマージ用（明示フラット化）
-    spy_m = spy[["date","mkt_ret","close"]].copy()
-    spy_m = force_plain(spy_m).rename(columns={"close":"spy_close"})
-    spy_m = spy_m.reset_index(drop=True)
+    spy_m = spy[["date","mkt_ret","close"]].rename(columns={"close":"spy_close"}).copy()
 
     for t in tqdm(chosen, desc="Indicators + Signals", ncols=90):
-        df = fetched[t].copy()
-        df = force_plain(df).sort_values("date").reset_index(drop=True)
+        df = fetched[t].copy().sort_values("date").reset_index(drop=True)
 
         # 調整終値があれば優先
         if "adjClose" in df.columns and df["adjClose"].notna().any():
@@ -503,10 +485,7 @@ def main():
         df["ema20"]  = ema(df["close"], 20)
         df["ema50"]  = ema(df["close"], 50)
         df["ema200"] = ema(df["close"], 200)
-        if {"high","low"}.issubset(df.columns):
-            df["atr14"]  = atr(df, 14)
-        else:
-            df["atr14"]  = np.nan
+        df["atr14"]  = atr(df, 14)
 
         # リターン系列
         for n in [1,5,20,60,120,252]:
@@ -530,21 +509,13 @@ def main():
         merged["beta_r2"] = r2_s
         df = pd.merge(df, merged[["date","beta_60d_vs_SPY","beta_r2"]], on="date", how="left")
 
-        # パターン（high/lowが無ければ False に）
-        if {"high","low"}.issubset(df.columns):
-            df["inside_day"] = inside_day(df)
-            df["NR7"] = nr7(df)
-        else:
-            df["inside_day"] = False
-            df["NR7"] = False
+        # パターン
+        df["inside_day"] = inside_day(df)
+        df["NR7"] = nr7(df)
 
         # 出来高異常
-        if "volume" in df.columns:
-            df["adv20_shares"] = df["volume"].rolling(20).mean()
-            df["vol_spike"]    = df["volume"] / df["adv20_shares"]
-        else:
-            df["adv20_shares"] = np.nan
-            df["vol_spike"]    = np.nan
+        df["adv20_shares"] = df["volume"].rolling(20).mean()
+        df["vol_spike"]    = df["volume"] / df["adv20_shares"]
 
         # シグナル
         last = df.iloc[-1]
@@ -563,22 +534,21 @@ def main():
         # Prices（B）
         change_abs = float(last["close"] - (prev["close"] if prev is not None else last["close"]))
         change_pct = float(last["r_1d"]) if pd.notna(last.get("r_1d")) else 0.0
-        vol_val = float(last["volume"]) if ("volume" in df.columns and pd.notna(last.get("volume"))) else np.nan
         prices_rows.append([
             t,
-            "",  # nameは省略（上でbasicから拾わない簡素版）
-            "",  # exchange 不明：空
+            (basic.loc[basic["ticker"]==t, "name"].iloc[0] if (basic["ticker"]==t).any() else ""),
+            uni_df.loc[uni_df["ticker"]==t, "exchange"].iloc[0] if (uni_df["ticker"]==t).any() else "",
             float(last["close"]),
             change_abs,
             change_pct,
-            int(vol_val) if pd.notna(vol_val) else "",
+            int(last["volume"]) if pd.notna(last["volume"]) else "",
             float(last["atr14"]) if pd.notna(last["atr14"]) else "",
             float(last["ema20"]) if pd.notna(last["ema20"]) else "",
             float(last["ema50"]) if pd.notna(last["ema50"]) else "",
             signal,
             "EOD",
-            0,
-            "",
+            0,    # stale
+            "",   # missing_reason
             dt.utcnow().strftime("%Y-%m-%d")
         ])
 
@@ -609,7 +579,7 @@ def main():
             float(last.get("vol_20d_ann", np.nan)) if pd.notna(last.get("vol_20d_ann", np.nan)) else "",
             float(last.get("atr14_pct", np.nan))   if pd.notna(last.get("atr14_pct", np.nan))   else "",
             float(last.get("adv20_shares", np.nan))if pd.notna(last.get("adv20_shares", np.nan))else "",
-            float(last.get("adv20_shares", np.nan))*float(last["close"]) if pd.notna(last.get("adv20_shares", np.nan)) and pd.notna(last.get("close", np.nan)) else "",
+            float(last.get("adv20_shares", np.nan))*float(last["close"]) if pd.notna(last.get("adv20_shares", np.nan)) else "",
             float(last.get("dist_52w_high", np.nan)) if pd.notna(last.get("dist_52w_high", np.nan)) else "",
             float(last.get("dist_52w_low", np.nan))  if pd.notna(last.get("dist_52w_low", np.nan))  else "",
             rs_12w_score,
@@ -638,7 +608,7 @@ def main():
                      "comp_score","risk_band","analysis_note","inside_day","NR7"]
     analysis_df = pd.DataFrame(analysis_rows, columns=analysis_cols)
 
-    # rs_12w_percentile：全体ランク
+    # rs_12w_percentile：全体ランクに変換
     vals = pd.to_numeric(analysis_df["rs_12w_percentile"], errors="coerce")
     ranks = vals.rank(pct=True) * 100.0
     analysis_df["rs_12w_percentile"] = ranks.round(2)
@@ -654,16 +624,19 @@ def main():
     risk = -zscore(pd.to_numeric(analysis_df["vol_20d_ann"], errors="coerce"))
 
     comp = (0.4*mom.fillna(0) + 0.3*rs.fillna(0) + 0.2*trd.fillna(0) + 0.1*risk.fillna(0))
-    comp_norm = ( (comp - comp.min()) / (comp.max() - comp.min()) * 100.0 ) if comp.max() != comp.min() else pd.Series(50.0, index=comp.index)
+    if comp.max() == comp.min():
+        comp_norm = pd.Series(50.0, index=comp.index)
+    else:
+        comp_norm = ((comp - comp.min()) / (comp.max() - comp.min()) * 100.0)
     analysis_df["comp_score"] = comp_norm.round(1)
 
-    # risk_band（三分位）
+    # risk_band
     try:
         analysis_df["risk_band"] = pd.qcut(pd.to_numeric(analysis_df["vol_20d_ann"], errors="coerce"), 3, labels=["Low","Med","High"]).astype(str)
     except Exception:
         analysis_df["risk_band"] = ""
 
-    # analysis_note（簡易）
+    # analysis_note
     notes = []
     for _, r in analysis_df.iterrows():
         note = []
@@ -701,8 +674,7 @@ def main():
         if pd.to_numeric(r["vol_spike"], errors="coerce") >= 2.5:
             flags.append("出来高スパイク(2.5x+)")
         if flags:
-            score_val = pd.to_numeric(r["comp_score"], errors="coerce")
-            alerts.append((r["ticker"], ", ".join(flags), float(score_val) if pd.notna(score_val) else -1.0))
+            alerts.append((r["ticker"], ", ".join(flags), float(pd.to_numeric(r["comp_score"], errors="coerce") if pd.notna(r["comp_score"]) else -1)))
     alerts = sorted(alerts, key=lambda x: x[2], reverse=True)[:200]
 
     # 7) 出力
@@ -727,7 +699,6 @@ def main():
         "selected_universe_N": int(len(prices_df)),
         "rows_returned": int(len(prices_df)),
         "coverage_pct": 100.0 if len(prices_df)>0 else 0.0,
-        "fill_rate_vs_planned_pct": (len(prices_df) / args.N * 100.0) if args.N > 0 else 0.0,
         "missing_symbols": "",
         "data_source_notes": f"fetch_order={order}; universe_source={uni_src_order}; master_saved_as={master_saved_as}"
     }])
@@ -751,28 +722,6 @@ def main():
             f.write(f"{i:02d}. {tic} — {flg}（comp_score={score:.1f}）\n")
 
     print(f"[DONE] Outputs saved to: {outdir}")
-
-def build_universe(keys: List[str], source_order: List[str]) -> pd.DataFrame:
-    last_err = None
-    for src in source_order:
-        try:
-            if src == "wiki":
-                return hydrate_universe_from_wiki(keys)
-            elif src == "yf":
-                return hydrate_universe_from_yf(keys)
-            elif src.startswith("file:"):
-                path = src.split("file:",1)[1]
-                df = pd.read_csv(path)
-                assert "ticker" in df.columns
-                if "name" not in df.columns:
-                    df["name"] = ""
-                df["list_source"] = "file"
-                df["ticker"] = df["ticker"].astype(str).str.strip().str.upper()
-                return df[["ticker","name","list_source"]].drop_duplicates("ticker").reset_index(drop=True)
-        except Exception as e:
-            last_err = e
-            continue
-    raise RuntimeError(f"Universe build failed. Last error: {last_err}")
 
 if __name__ == "__main__":
     main()
