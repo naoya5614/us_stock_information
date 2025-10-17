@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 EOD（前日終値）×上位流動性N銘柄の一括取得→分析→A〜F出力
-- 取得戦略：yfinance バルク(200銘柄塊) → Tiingo(不足のみ) → AlphaVantage(不足のみ) → Stooq(不足のみ)
+- 取得戦略：Stooq（最優先・無料EOD） → yfinance バルク(不足のみ) → Tiingo(不足のみ) → AlphaVantage(不足のみ)
 - 取得できた銘柄の中から ADV20（出来高×終値）上位で N を確定
 - 確定N銘柄に対して coverage=100% を担保（未取得銘柄は集合から外す）
 - すべてEODベース（リアルタイム/時間外は未取得）
@@ -22,7 +22,7 @@ EOD（前日終値）×上位流動性N銘柄の一括取得→分析→A〜F出
 
 import os, sys, time, argparse
 from datetime import datetime as dt, timedelta, timezone
-from typing import List, Tuple, Optional, Dict, Iterable
+from typing import List, Tuple, Optional, Dict
 
 import numpy as np
 import pandas as pd
@@ -33,7 +33,7 @@ from tqdm import tqdm
 # ---------- 基本設定 ----------
 DEFAULT_OUTDIR = "./out"
 DEFAULT_N = 1500
-CAL_DAYS_BACK = 560          # 約400営業日相当
+CAL_DAYS_BACK = 300          # レポートに十分＆軽量化
 SPY_SYMBOL = "SPY"          # RS/βのベンチマーク
 JST = timezone(timedelta(hours=9))
 
@@ -44,7 +44,7 @@ def jst_now_str() -> str:
 def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
 
-def robust_get(url: str, params=None, headers=None, timeout=30, retries=3, backoff=1.6):
+def robust_get(url: str, params=None, headers=None, timeout=25, retries=3, backoff=1.6):
     for i in range(retries):
         try:
             r = requests.get(url, params=params, headers=headers, timeout=timeout)
@@ -58,7 +58,6 @@ def robust_get(url: str, params=None, headers=None, timeout=30, retries=3, backo
 def normalize_price_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     if df is None or df.empty:
         return None
-    # 列正規化
     colmap = {
         "Date":"date","date":"date",
         "Open":"open","open":"open",
@@ -72,7 +71,6 @@ def normalize_price_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     need = {"date","open","high","low","close","volume"}
     if not need.issubset(set(df.columns)):
         return None
-    # 型とNaN処理
     df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
     for c in ["open","high","low","close","volume","adjClose"]:
         if c in df.columns:
@@ -86,37 +84,30 @@ def normalize_price_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
 def hydrate_universe_from_yf(keys: List[str]) -> pd.DataFrame:
     """
     yfinance の内蔵一覧を使ってユニバースを組む。
-    失敗しやすいNasdaq全量は使わず、sp500/dow30/nasdaq100 の堅い集合に限定。
+    安定性重視: sp500 / dow30 を確実化。nasdaq100 はシード補完。
     """
     rows = []
     try:
-        if any(k in ("sp500", "s&p500") for k in keys):
+        if any(k in ("sp500","s&p500") for k in keys):
             for t in yf.tickers_sp500():
                 rows.append((t, "", "sp500"))
     except Exception:
         pass
     try:
-        if any(k in ("dow30", "dow") for k in keys):
+        if any(k in ("dow30","dow") for k in keys):
             for t in yf.tickers_dow():
                 rows.append((t, "", "dow30"))
     except Exception:
         pass
-    try:
-        if any(k in ("nasdaq100", "ndx") for k in keys):
-            # yfinanceは明示関数なしのため、代替：上位科技の既知リストを補完
-            # ここではsp500/dow30に含まれないNDX有名銘柄を追加（簡易）
-            extra = ["AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","AVGO","TSLA","PEP","COST","ADBE",
-                     "NFLX","AMD","INTC","CSCO","QCOM","TXN","AMAT","INTU","PDD","LIN","BKNG","ADI","PYPL",
-                     "SBUX","HON","MDLZ","VRTX","MU","CHTR","REGN","LRCX","ABNB","MON","MRVL","PANW"]
-            for t in extra:
-                rows.append((t, "", "nasdaq100_seed"))
-    except Exception:
-        pass
+    if any(k in ("nasdaq100","ndx") for k in keys):
+        # 代表的なNDX銘柄を補完（yfinanceに明示関数がないため簡易シード）
+        extra = ["AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","AVGO","TSLA","PEP","COST","ADBE",
+                 "NFLX","AMD","INTC","CSCO","QCOM","TXN","AMAT","INTU","LIN","BKNG","ADI","PYPL",
+                 "SBUX","HON","MDLZ","VRTX","MU","REGN","LRCX","ABNB","MRVL","PANW"]
+        rows.extend([(t,"","nasdaq100_seed") for t in extra])
 
     if not rows:
-        # シードにフォールバック
-        seed = ["AAPL","MSFT","NVDA","AMZN","GOOGL","GOOG","META","TSLA","AVGO","BRK-B",
-                "UNH","JPM","XOM","JNJ","V","PG","MA","COST","HD","CVX"]
+        seed = ["AAPL","MSFT","NVDA","AMZN","GOOGL","GOOG","META","TSLA","AVGO","BRK-B","UNH","JPM","XOM","V","PG","MA"]
         rows = [(t, "", "seed_top_liquidity") for t in seed]
 
     df = pd.DataFrame(rows, columns=["ticker","name","list_source"]).drop_duplicates("ticker")
@@ -143,14 +134,34 @@ def build_universe(keys: List[str], source_order: List[str]) -> pd.DataFrame:
             continue
     raise RuntimeError(f"Universe build failed. Last error: {last_err}")
 
-# ---------- データ取得：各ソース ----------
-def yf_bulk_download(tickers: List[str], start: str, end: str, chunk_size: int=200) -> Dict[str, pd.DataFrame]:
-    """
-    yfinanceの一括DL（200銘柄バッチ）でHTTP回数を劇的に削減。
-    返り値: {ticker: df}（失敗はキー欠落）
-    """
+# ---------- Stooq (最優先フォールバック兼一次) ----------
+def to_stooq_symbol(ticker: str) -> str:
+    # BRK.B → brk-b.us / BRK-B → brk-b.us などに変換
+    t = ticker.upper().replace("/", "-").replace("^","")
+    t = t.replace(".", "-")
+    return t.lower() + ".us"
+
+def stooq_daily(ticker: str, start: str, end: str) -> Optional[pd.DataFrame]:
+    sym = to_stooq_symbol(ticker)
+    url = f"https://stooq.com/q/d/l/?s={sym}&i=d"
+    r = robust_get(url, timeout=20)
+    if not r or not r.text or r.text.strip().lower().startswith("error"):
+        return None
+    try:
+        from io import StringIO
+        df = pd.read_csv(StringIO(r.text))
+    except Exception:
+        return None
+    df = normalize_price_df(df)
+    if df is None:
+        return None
+    mask = (df["date"] >= pd.to_datetime(start)) & (df["date"] <= pd.to_datetime(end))
+    df = df.loc[mask].reset_index(drop=True)
+    return df if not df.empty else None
+
+# ---------- yfinance ----------
+def yf_bulk_download(tickers: List[str], start: str, end: str, chunk_size: int=150, sleep_s: float=0.8) -> Dict[str, pd.DataFrame]:
     out: Dict[str, pd.DataFrame] = {}
-    # yfinanceのendは「非包含」なので+1日しておく
     end_plus = (pd.to_datetime(end) + timedelta(days=1)).strftime("%Y-%m-%d")
     for i in range(0, len(tickers), chunk_size):
         batch = [t for t in tickers[i:i+chunk_size] if t != SPY_SYMBOL]
@@ -158,37 +169,25 @@ def yf_bulk_download(tickers: List[str], start: str, end: str, chunk_size: int=2
             continue
         try:
             raw = yf.download(
-                tickers=batch,
-                start=start, end=end_plus,
-                interval="1d",
-                group_by="ticker",
-                auto_adjust=False,
-                threads=True,
-                progress=False
+                tickers=batch, start=start, end=end_plus, interval="1d",
+                group_by="ticker", auto_adjust=False, threads=True, progress=False
             )
             if raw is None or raw.empty:
-                continue
-            # 単一銘柄時は単純DF、複数銘柄時はカラムMultiIndex
+                time.sleep(sleep_s); continue
             if isinstance(raw.columns, pd.MultiIndex):
-                # {tic: df} に分解
                 for t in batch:
                     if t in raw.columns.get_level_values(0):
                         sub = raw[t].reset_index()
-                        sub = sub.rename(columns={"Adj Close":"Adj Close"})
                         df = normalize_price_df(sub)
                         if df is not None:
                             out[t] = df
             else:
-                # たまたま単一銘柄になった場合
                 df = normalize_price_df(raw.reset_index())
                 if df is not None and len(batch) == 1:
                     out[batch[0]] = df
         except Exception:
-            # バッチ失敗 → 小休止し次へ
-            time.sleep(1.0)
-            continue
-        # レート優しめ
-        time.sleep(0.5)
+            pass
+        time.sleep(sleep_s)
     return out
 
 def yf_single(ticker: str, start: str, end: str) -> Optional[pd.DataFrame]:
@@ -201,6 +200,7 @@ def yf_single(ticker: str, start: str, end: str) -> Optional[pd.DataFrame]:
     except Exception:
         return None
 
+# ---------- Tiingo / AlphaVantage ----------
 def tiingo_daily(ticker: str, token: Optional[str], start: str, end: str) -> Optional[pd.DataFrame]:
     if not token:
         return None
@@ -214,9 +214,6 @@ def tiingo_daily(ticker: str, token: Optional[str], start: str, end: str) -> Opt
         if not isinstance(data, list) or not data:
             return None
         df = pd.DataFrame(data)
-        # Tiingoのキー合わせ
-        if "adjClose" not in df.columns and "adjClose" in df:
-            pass
         return normalize_price_df(df)
     except Exception:
         return None
@@ -252,33 +249,7 @@ def alphav_daily_adj(ticker: str, apikey: Optional[str], start: str, end: str) -
     except Exception:
         return None
 
-# --- Stooq fallback（超軽量CSV: aapl.us など） ---
-def to_stooq_symbol(ticker: str) -> str:
-    # BRK-B, RDS-Aなどのクラス記号に対応（小文字＋.us）
-    t = ticker.upper().replace("/", "-").replace("^","")
-    t = t.replace(".", "-")
-    return t.lower() + ".us"
-
-def stooq_daily(ticker: str, start: str, end: str) -> Optional[pd.DataFrame]:
-    sym = to_stooq_symbol(ticker)
-    url = f"https://stooq.com/q/d/l/?s={sym}&i=d"
-    r = robust_get(url, timeout=20)
-    if not r or not r.text or r.text.strip().lower().startswith("error"):
-        return None
-    try:
-        df = pd.read_csv(pd.compat.StringIO(r.text))
-    except Exception:
-        from io import StringIO
-        df = pd.read_csv(StringIO(r.text))
-    df = normalize_price_df(df)
-    if df is None:
-        return None
-    # 期間フィルタ
-    mask = (df["date"] >= pd.to_datetime(start)) & (df["date"] <= pd.to_datetime(end))
-    df = df.loc[mask].reset_index(drop=True)
-    return df if not df.empty else None
-
-# ---------- 指標 ----------
+# ---------- テクニカル ----------
 def ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
 
@@ -317,9 +288,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--N", type=int, default=DEFAULT_N)
     ap.add_argument("--outdir", type=str, default=DEFAULT_OUTDIR)
-    ap.add_argument("--universe", type=str, default="sp500,nasdaq100,dow30")
+    ap.add_argument("--universe", type=str, default="sp500,dow30,nasdaq100")
     ap.add_argument("--since_days", type=int, default=CAL_DAYS_BACK)
-    ap.add_argument("--source_order", type=str, default="yf,tiingo,alphav,stooq")
+    ap.add_argument("--source_order", type=str, default="stooq,yf,tiingo,alphav")
     ap.add_argument("--universe_source", type=str, default="yf")
     args = ap.parse_args()
 
@@ -338,14 +309,14 @@ def main():
 
     run_ts = jst_now_str()
     start_date = (dt.utcnow().date() - timedelta(days=args.since_days)).strftime("%Y-%m-%d")
-    end_date   = (dt.utcnow().date()).strftime("%Y-%m-%d")
+    end_date   = dt.utcnow().date().strftime("%Y-%m-%d")
 
     # 1) ユニバース
     idx_keys = [k.strip().lower() for k in args.universe.split(",") if k.strip()]
-    uni_df = build_universe(idx_keys, uni_src_order)  # ticker, name, list_source
-    print(f"[universe] source_order={uni_src_order}, size={len(uni_df)} (first 10)", uni_df["ticker"].head(10).tolist())
+    uni_df = build_universe(idx_keys, uni_src_order)
+    print(f"[universe] source={uni_src_order}, size={len(uni_df)} (first 10) {uni_df['ticker'].head(10).tolist()}")
 
-    # 保存（parquet優先）
+    # 保存
     sm_parq = os.path.join(outdir, "security_master_us.parquet")
     sm_csv  = os.path.join(outdir, "security_master_us.csv")
     master_saved_as = "parquet"
@@ -356,66 +327,67 @@ def main():
         uni_df.to_csv(sm_csv, index=False)
         master_saved_as = "csv"
 
-    # 2) SPY（ベンチマーク）
+    # 2) SPY（最優先順で取得）
     spy_df = None
-    # SPYは最優先でyfinance単体→AV→Stooq
-    for fn in (lambda: yf_single(SPY_SYMBOL, start_date, end_date),
-               lambda: alphav_daily_adj(SPY_SYMBOL, alphav_key, start_date, end_date),
-               lambda: stooq_daily(SPY_SYMBOL, start_date, end_date)):
-        spy_df = fn()
+    for getter in (lambda: stooq_daily(SPY_SYMBOL, start_date, end_date),
+                   lambda: yf_single(SPY_SYMBOL, start_date, end_date),
+                   lambda: alphav_daily_adj(SPY_SYMBOL, alphav_key, start_date, end_date)):
+        spy_df = getter()
         if spy_df is not None and not spy_df.empty:
             break
     if spy_df is None or spy_df.empty:
-        raise RuntimeError("SPYのEOD取得に失敗しました。ネットワーク/データ源をご確認ください。")
+        raise RuntimeError("SPYのEOD取得に失敗しました。")
     spy = spy_df.sort_values("date").copy()
     spy["mkt_ret"] = spy["close"].pct_change()
     spy_m = spy[["date","mkt_ret","close"]].rename(columns={"close":"spy_close"}).copy()
 
-    # 3) 各銘柄のEOD取得（Bulk→不足分だけ個別フォールバック）
+    # 3) 価格取得（Stooq→yfinance→Tiingo→AV）
     fetched: Dict[str, pd.DataFrame] = {}
     used_src: Dict[str, str] = {}
     tickers = [t for t in uni_df["ticker"].tolist() if t.upper() != SPY_SYMBOL]
 
-    # 3-1) yfinance bulk
-    yf_bulk = yf_bulk_download(tickers, start_date, end_date, chunk_size=200)
-    for t, df in yf_bulk.items():
-        fetched[t] = df
-        used_src[t] = "yf"
-    print(f"[fetch] yfinance bulk ok: {len(yf_bulk)} / {len(tickers)}")
+    # 3-1 Stooq first（超軽量CSV）
+    if "stooq" in order:
+        for t in tqdm(tickers, desc="Stooq first", ncols=90):
+            df = stooq_daily(t, start_date, end_date)
+            if df is not None and not df.empty:
+                fetched[t] = df; used_src[t] = "stooq"
+            time.sleep(0.02)  # やさしめ
+        print(f"[fetch] Stooq ok: {sum(1 for v in used_src.values() if v=='stooq')} / {len(tickers)}")
 
-    # 3-2) 不足分に段階フォールバック
+    # 3-2 yfinance（不足のみをバルク）
+    missing = [t for t in tickers if t not in fetched]
+    if missing and "yf" in order:
+        yf_bulk = yf_bulk_download(missing, start_date, end_date, chunk_size=150, sleep_s=0.8)
+        for t, df in yf_bulk.items():
+            fetched[t] = df; used_src[t] = "yf"
+        print(f"[fetch] yfinance ok: {sum(1 for v in used_src.values() if v=='yf')} (added)")
+
+    # 3-3 Tiingo（さらに不足）
     missing = [t for t in tickers if t not in fetched]
     if missing and "tiingo" in order:
         for t in tqdm(missing, desc="Tiingo (missing only)", ncols=90):
             df = tiingo_daily(t, tiingo_token, start_date, end_date)
             if df is not None and not df.empty:
                 fetched[t] = df; used_src[t] = "tiingo"
-        missing = [t for t in missing if t not in fetched]
-        print(f"[fetch] Tiingo ok: {len([1 for v in used_src.values() if v=='tiingo'])}")
+        print(f"[fetch] Tiingo ok: {sum(1 for v in used_src.values() if v=='tiingo')} (added)")
 
+    # 3-4 AlphaVantage（最後、上限を抑制）
+    missing = [t for t in tickers if t not in fetched]
     if missing and "alphav" in order:
-        # AlphaVantageは厳しいので、最初の数百件だけ試行
-        for t in tqdm(missing[:400], desc="AlphaVantage (cap 400)", ncols=90):
+        cap = min(400, len(missing))
+        for t in tqdm(missing[:cap], desc="AlphaVantage (cap)", ncols=90):
             df = alphav_daily_adj(t, alphav_key, start_date, end_date)
             if df is not None and not df.empty:
                 fetched[t] = df; used_src[t] = "alphav"
-        missing = [t for t in missing if t not in fetched]
-        print(f"[fetch] AlphaVantage ok: {len([1 for v in used_src.values() if v=='alphav'])}")
+        print(f"[fetch] AlphaVantage ok: {sum(1 for v in used_src.values() if v=='alphav')} (added)")
 
-    if missing and "stooq" in order:
-        for t in tqdm(missing, desc="Stooq (final fallback)", ncols=90):
-            df = stooq_daily(t, start_date, end_date)
-            if df is not None and not df.empty:
-                fetched[t] = df; used_src[t] = "stooq"
-        missing = [t for t in missing if t not in fetched]
-        print(f"[fetch] Stooq ok: {len([1 for v in used_src.values() if v=='stooq'])}")
-
+    total_ok = len(fetched)
+    print(f"[fetch] total ok: {total_ok} / {len(tickers)}")
     if not fetched:
         raise RuntimeError("EODを取得できた銘柄がありません。レート制限/ネットワーク/依存関係をご確認ください。")
 
-    print(f"[fetch] total ok: {len(fetched)} / {len(tickers)}")
-
-    # 4) ADV20 Notional算出→上位N選定（“取得できた集合”に対して実施）
+    # 4) ADV20 Notional → N選定（“取得できた集合”に対して）
     rows = []
     for t, df in fetched.items():
         adv20 = df["volume"].tail(20).mean() if len(df) >= 20 else np.nan
@@ -430,16 +402,11 @@ def main():
     realized_N = min(args.N, len(basic))
     chosen = basic.head(realized_N)["ticker"].tolist()
 
-    # 5) 指標計算（選定N）
-    prices_rows = []
-    analysis_rows = []
-
-    spy_m = spy_m.copy()  # date, mkt_ret, spy_close
+    # 5) 指標計算
+    prices_rows, analysis_rows = [], []
 
     for t in tqdm(chosen, desc="Indicators + Signals", ncols=90):
         df = fetched[t].copy().sort_values("date").reset_index(drop=True)
-
-        # 調整終値があれば優先
         if "adjClose" in df.columns and df["adjClose"].notna().any():
             df["close"] = df["adjClose"].fillna(df["close"])
 
@@ -449,7 +416,7 @@ def main():
         df["ema200"] = ema(df["close"], 200)
         df["atr14"]  = atr(df, 14)
 
-        # リターン系列
+        # リターン
         for n in [1,5,20,60,120,252]:
             df[f"r_{n}d"] = df["close"].pct_change(n)*100.0
 
@@ -508,12 +475,12 @@ def main():
             float(last["ema50"]) if pd.notna(last["ema50"]) else "",
             signal,
             "EOD",
-            0,    # stale
-            "",   # missing_reason
+            0,
+            "",
             dt.utcnow().strftime("%Y-%m-%d")
         ])
 
-        # RS(12w)パーセンタイル
+        # RS(12w)→パーセンタイル化は後段
         rs_12w_score = np.nan
         tmp = pd.merge(df[["date","close"]], spy[["date","close"]].rename(columns={"close":"spy_close"}), on="date", how="inner")
         if len(tmp) >= 60:
@@ -543,15 +510,15 @@ def main():
             float(last.get("adv20_shares", np.nan))*float(last["close"]) if pd.notna(last.get("adv20_shares", np.nan)) else "",
             float(last.get("dist_52w_high", np.nan)) if pd.notna(last.get("dist_52w_high", np.nan)) else "",
             float(last.get("dist_52w_low", np.nan))  if pd.notna(last.get("dist_52w_low", np.nan))  else "",
-            rs_12w_score,  # 後で全体パーセンタイルに変換
+            rs_12w_score,
             trend_stack,
             new_high_20d,
             new_low_20d,
             float(last.get("vol_spike", np.nan)) if pd.notna(last.get("vol_spike", np.nan)) else "",
             float(last.get("beta_60d_vs_SPY", np.nan)) if pd.notna(last.get("beta_60d_vs_SPY", np.nan)) else "",
             float(last.get("beta_r2", np.nan))         if pd.notna(last.get("beta_r2", np.nan))         else "",
-            "unknown",  # earnings_within_7d
-            "", "", "",  # comp_score, risk_band, analysis_note（後で埋める）
+            "unknown",
+            "", "", "",
             bool(last.get("inside_day", False)),
             bool(last.get("NR7", False)),
         ])
@@ -585,10 +552,7 @@ def main():
     risk = -zscore(pd.to_numeric(analysis_df["vol_20d_ann"], errors="coerce"))
 
     comp = (0.4*mom.fillna(0) + 0.3*rs.fillna(0) + 0.2*trd.fillna(0) + 0.1*risk.fillna(0))
-    if comp.max() == comp.min():
-        comp_norm = pd.Series(50.0, index=comp.index)
-    else:
-        comp_norm = ((comp - comp.min()) / (comp.max() - comp.min()) * 100.0)
+    comp_norm = pd.Series(50.0, index=comp.index) if comp.max()==comp.min() else ((comp - comp.min())/(comp.max()-comp.min())*100.0)
     analysis_df["comp_score"] = comp_norm.round(1)
 
     # risk_band（三分位）
@@ -640,9 +604,8 @@ def main():
     alerts = sorted(alerts, key=lambda x: x[2], reverse=True)[:200]
 
     # 7) 出力
-    # A
     with open(os.path.join(outdir, "market_summary.txt"), "w", encoding="utf-8") as f:
-        f.write(f"Market Summary — {run_ts}\n\n")
+        f.write(f"Market Summary — {jst_now_str()}\n\n")
         f.write(f"選定N（realized）: {len(prices_df)}\n")
         f.write(f"値上がり数: {rising} / 値下がり数: {falling}\n\n")
         f.write("【上昇率トップ20】\n")
@@ -652,33 +615,28 @@ def main():
         for _, r in dn_df.iterrows():
             f.write(f"{r['ticker']}: {r['change_pct']:.2f}%\n")
 
-    # B
     prices_df.to_csv(os.path.join(outdir, "prices_us_all.csv"), index=False)
 
-    # C（選定集合に対して100%）
     cov = pd.DataFrame([{
         "planned_universe_N": int(args.N),
         "selected_universe_N": int(len(prices_df)),
         "rows_returned": int(len(prices_df)),
         "coverage_pct": float(100.0 if len(prices_df)>0 else 0.0),
         "missing_symbols": "",
-        "data_source_notes": f"fetch_order={order}; universe_source={uni_src_order}; master_saved_as={master_saved_as}"
+        "data_source_notes": f"fetch_order={order}; universe_source={uni_src_order}; master_saved_as=parquet/csv"
     }])
     cov.to_csv(os.path.join(outdir, "coverage_report_us.csv"), index=False)
 
-    # D
     eod_target = spy["date"].max().strftime("%Y-%m-%d")
     with open(os.path.join(outdir, "data_info_us.txt"), "w", encoding="utf-8") as f:
         f.write("Data Timestamp & Sources (EOD-only)\n")
         f.write(f"EOD target date: {eod_target}\n")
         f.write(f"Fetch order: {order}\n")
         f.write(f"Universe source: {uni_src_order}\n")
-        f.write(f"Run time (JST): {run_ts}\n")
+        f.write(f"Run time (JST): {jst_now_str()}\n")
 
-    # E
     analysis_df.to_csv(os.path.join(outdir, "stock_analysis_us.csv"), index=False)
 
-    # F
     with open(os.path.join(outdir, "stock_alerts_us.txt"), "w", encoding="utf-8") as f:
         for i, (tic, flg, score) in enumerate(alerts[:50], 1):
             f.write(f"{i:02d}. {tic} — {flg}（comp_score={score:.1f}）\n")

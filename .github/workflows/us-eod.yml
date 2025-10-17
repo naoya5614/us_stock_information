@@ -1,7 +1,7 @@
-name: US EOD Liquidity Report (Bulk + Fallback)
+name: US EOD Liquidity Report (Stooq-first)
 
 on:
-  workflow_dispatch: {}     # 手動起動
+  workflow_dispatch: {}     # 手動実行
   schedule:
     - cron: '40 10 * * 1-5' # 19:40 JST (平日)
     - cron: '00 11 * * 1-5' # 20:00 JST (平日)
@@ -29,9 +29,9 @@ jobs:
 
       - name: Smoke test env
         shell: bash
-        run: "python -c \"import pandas, numpy, yfinance; print('OK: imports')\""
+        run: "python -c 'import pandas, numpy, yfinance; print(\"OK: imports\")'"
 
-      - name: Run report (bulk-first; robust fallbacks)
+      - name: Run report (stooq-first; robust fallbacks)
         shell: bash
         env:
           TIINGO_API_TOKEN: ${{ secrets.TIINGO_API_TOKEN }}
@@ -43,10 +43,10 @@ jobs:
           mkdir -p out/$TS
           python run_us_eod_liquidity_report.py \
             --N 3000 \
-            --since_days 560 \
-            --universe "sp500,nasdaq100,dow30" \
+            --since_days 300 \
+            --universe "sp500,dow30,nasdaq100" \
             --universe_source "yf" \
-            --source_order "yf,tiingo,alphav,stooq" \
+            --source_order "stooq,yf,tiingo,alphav" \
             --outdir out/$TS
           rm -rf out/latest && mkdir -p out/latest && cp -r out/$TS/* out/latest/
 
