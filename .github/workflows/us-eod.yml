@@ -1,7 +1,7 @@
-name: US EOD Liquidity Report (Stooq-first)
+name: US EOD Liquidity Report (1000+ target)
 
 on:
-  workflow_dispatch: {}     # 手動実行
+  workflow_dispatch: {}     # 手動でも回せる
   schedule:
     - cron: '40 10 * * 1-5' # 19:40 JST (平日)
     - cron: '00 11 * * 1-5' # 20:00 JST (平日)
@@ -28,10 +28,9 @@ jobs:
           pip install pandas numpy requests tqdm pyarrow yfinance
 
       - name: Smoke test env
-        shell: bash
         run: "python -c 'import pandas, numpy, yfinance; print(\"OK: imports\")'"
 
-      - name: Run report (stooq-first; robust fallbacks)
+      - name: Run report (bulk+retry; 1000+ target)
         shell: bash
         env:
           TIINGO_API_TOKEN: ${{ secrets.TIINGO_API_TOKEN }}
@@ -41,12 +40,13 @@ jobs:
           set -euo pipefail
           TS=$(TZ=Asia/Tokyo date +%Y%m%d)
           mkdir -p out/$TS
+          # 期間短縮で成功率UP（EOD分析には十分）
           python run_us_eod_liquidity_report.py \
             --N 3000 \
-            --since_days 300 \
-            --universe "sp500,dow30,nasdaq100" \
+            --since_days 200 \
+            --universe "sp500,dow30,nasdaq100,nasdaq" \
             --universe_source "yf" \
-            --source_order "stooq,yf,tiingo,alphav" \
+            --source_order "yf,stooq,tiingo,alphav" \
             --outdir out/$TS
           rm -rf out/latest && mkdir -p out/latest && cp -r out/$TS/* out/latest/
 
