@@ -169,7 +169,7 @@ pathlib.Path("data/universe.csv").write_text(df.to_csv(index=False), encoding="u
 print(f"[universe-csv] rows={len(df)}  sample={df['ticker'].head(10).tolist()}")
 PY
 
-          python build_universe.py
+          python3 build_universe.py
 
       # === レポート実行（EOD／上位流動性N銘柄、ユニバースは上のCSV、データ源は yf→tiingo→alphav） ===
       - name: Run report (EOD, top-liquidity, CSV universe, yf→tiingo→alphav)
