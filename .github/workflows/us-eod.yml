@@ -3,8 +3,8 @@ name: US EOD Liquidity Report (Diag Safe)
 on:
   workflow_dispatch: {}     # 手動実行用
   schedule:
-    # 実行開始：17:00 JST（= 08:00 UTC）。処理に ~2h かかる前提で 19時台の締め切りに間に合わせる
-    - cron: '00 08 * * 1-5' # 平日 08:00 UTC
+    # 実行開始：9:00 JST（= 00:00 UTC）。処理に ~2h かかる前提
+    - cron: '00 00 * * 1-5' # 平日 09:00 UTC
 
 jobs:
   run:
